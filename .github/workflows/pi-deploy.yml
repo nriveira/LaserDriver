@@ -135,13 +135,19 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: laserhat-deb-${{ matrix.arch }}
-      # The runner's preinstalled dynamic qemu-user binfmt handlers
-      # (arm-binfmt-P) can't run ARM binaries inside a chroot; this
-      # action replaces them with static fix-binary handlers.
-      - name: Register QEMU binfmt handlers for the ARM chroot
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm,arm64
+      # The runner preinstalls dynamic qemu-user binfmt handlers
+      # (…-binfmt-P) that cannot work inside a chroot.  Purge them and
+      # register qemu-user-static's fix-binary (F flag) handlers instead:
+      # the kernel pre-opens the static interpreter, so it keeps working
+      # after the chroot switches the filesystem root.
+      - name: Register static QEMU binfmt handlers for the ARM chroot
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo apt-get purge -y qemu-user-binfmt || true
+          sudo dpkg-reconfigure qemu-user-static
+          grep -H . /proc/sys/fs/binfmt_misc/qemu-aarch64 \
+                    /proc/sys/fs/binfmt_misc/qemu-arm || true
       - name: Download official Raspberry Pi OS Lite image
         run: |
           curl -fsSL -o raspios.img.xz '${{ matrix.image_url }}'
@@ -166,6 +172,12 @@ jobs:
           sudo mount "${LOOP}p1" "$BOOTMNT"
           for fs in dev proc sys; do sudo mount --bind /$fs rootmnt/$fs; done
           sudo cp /etc/resolv.conf rootmnt/etc/resolv.conf
+          # Diagnostics: rootfs layout, guest loader, and binfmt handler,
+          # so a chroot failure below is attributable from the log alone.
+          sudo fdisk -l "$LOOP" | tail -5
+          ls rootmnt/ && ls -l rootmnt/lib | head -3
+          ls -l rootmnt/usr/lib/ld-linux* 2>/dev/null || true
+          file rootmnt/bin/sh
           sudo chroot rootmnt /bin/sh -c '
             set -e
             apt-get update
