@@ -10,7 +10,7 @@
 #
 #   /usr/bin/laserhat-oledd                          compiled SSD1305 daemon
 #   /usr/lib/laserhat/                               Python app (broker, GUIs)
-#   /lib/systemd/system/laserhat-*.service, oled-gui.service
+#   /usr/lib/systemd/system/laserhat-*.service, oled-gui.service
 #   /etc/NetworkManager/system-connections/laserhat-eth0.nmconnection
 #   /etc/modules-load.d/laserhat.conf                (i2c-dev)
 #
@@ -50,8 +50,8 @@ install -m 644 "$PI_DIR"/*.py "$PKG/usr/lib/laserhat/"
 install -m 644 "$PI_DIR"/templates/*.html "$PKG/usr/lib/laserhat/templates/"
 
 # --- systemd units ----------------------------------------------------------
-mkdir -p "$PKG/lib/systemd/system"
-install -m 644 "$PI_DIR"/systemd/*.service "$PKG/lib/systemd/system/"
+mkdir -p "$PKG/usr/lib/systemd/system"
+install -m 644 "$PI_DIR"/systemd/*.service "$PKG/usr/lib/systemd/system/"
 
 # --- static wired IP (192.168.17.10/24, no gateway) + i2c-dev module --------
 mkdir -p "$PKG/etc/NetworkManager/system-connections" "$PKG/etc/modules-load.d"
@@ -102,7 +102,7 @@ for unit in $UNITS; do
     if command -v deb-systemd-helper >/dev/null; then
         deb-systemd-helper enable "\$unit" >/dev/null || true
     else
-        ln -sf "/lib/systemd/system/\$unit" \\
+        ln -sf "/usr/lib/systemd/system/\$unit" \\
             "/etc/systemd/system/multi-user.target.wants/\$unit"
     fi
 done

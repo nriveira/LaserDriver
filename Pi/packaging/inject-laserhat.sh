@@ -77,6 +77,13 @@ mount "$ROOT_PART" "$ROOT_MNT"
 [ -d "$ROOT_MNT/etc/systemd/system" ] || die "$ROOT_PART doesn't look like a Linux rootfs"
 
 # --- rootfs: unpack the package payload ------------------------------------
+# Guard: on merged-usr Raspberry Pi OS, /lib /bin /sbin are symlinks into
+# /usr.  Plain extraction of a package that ships those top-level paths
+# would replace the symlink with a directory and brick every dynamic
+# binary in the image.  The laserhat package must only ship /usr and /etc.
+if dpkg-deb -c "$DEB" | awk '{print $6}' | grep -qE '^\./(lib|bin|sbin)/'; then
+    die "$DEB ships /lib, /bin or /sbin paths — would clobber merged-usr symlinks"
+fi
 dpkg-deb -x "$DEB" "$ROOT_MNT"
 chmod 600 "$ROOT_MNT/etc/NetworkManager/system-connections/laserhat-eth0.nmconnection"
 
@@ -95,7 +102,7 @@ fi
 # --- rootfs: enable the services (symlinks; no systemd needed here) --------
 mkdir -p "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
 for unit in laserhat-oledd laserhat-broker oled-gui laserhat-web; do
-    ln -sf "/lib/systemd/system/$unit.service" \
+    ln -sf "/usr/lib/systemd/system/$unit.service" \
            "$ROOT_MNT/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
 
