@@ -1,0 +1,31 @@
+# LaserHAT OLED panel daemon — the compiled SSD1305 driver (oledd.c).
+#
+# Owns /dev/i2c-1 + the panel and needs nothing else: it starts at boot
+# before the broker or any network, immediately showing hostname, the
+# wired/wifi IP addresses (or WAITING) and the heartbeat dot.  The OLED
+# GUI connects to /run/laserhat-oled/oled.sock and takes over the body
+# rows when it comes up.
+#
+# Installed by the laserhat package; the 'laserhat' system user is
+# created in the package postinst.
+
+[Unit]
+Description=LaserHAT OLED panel daemon (SSD1305, owns the display)
+
+[Service]
+Type=simple
+User=laserhat
+Group=laserhat
+# /dev/i2c-1 is root:i2c; /dev/gpiochip* (panel reset line) is root:gpio.
+SupplementaryGroups=i2c gpio
+RuntimeDirectory=laserhat-oled
+RuntimeDirectoryMode=0755
+Environment=LASERHAT_OLED_SOCK=/run/laserhat-oled/oled.sock
+ExecStart=/usr/bin/laserhat-oledd
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

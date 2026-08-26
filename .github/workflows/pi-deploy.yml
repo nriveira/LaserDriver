@@ -1,0 +1,210 @@
+name: pi-deploy
+
+# Build/test the Pi-side stack and, on version tags (git tag v1.0 &&
+# git push --tags), publish a Release with:
+#   - laserhat_<ver>_{arm64,armhf}.deb   install on a running Pi
+#   - inject-laserhat.sh                 bake into a flashed card/.img
+#   - golden Raspberry Pi OS Lite images with laserhat preinstalled
+#     (+ imager.json so Raspberry Pi Imager offers them with the full
+#      OS customisation step)
+#
+# Workflow modeled on ckemere/pioled-ip.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['PCB/**', 'Datasheets/**', 'LaserHAT/**']
+  pull_request:
+    paths-ignore: ['PCB/**', 'Datasheets/**', 'LaserHAT/**']
+
+jobs:
+  # Compile the real oledd drawing code natively and diff its output
+  # against the golden framebuffer dump — catches font/layout regressions.
+  render-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build oledd (native, warnings fatal)
+        run: gcc -O2 -Wall -Wextra -Werror -o /tmp/oledd Pi/oledd.c
+      - name: Build render test
+        run: gcc -O2 -Wall -Wextra -Werror -o /tmp/render-test Pi/tests/render-test.c
+      - name: Compare against golden output
+        run: /tmp/render-test | diff - Pi/tests/render-expected.txt
+
+  python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install test dependencies
+        run: pip install pyserial flask pytest
+      - name: Run Pi test suite (protocol codec, broker integration, web)
+        working-directory: Pi
+        run: python -m pytest tests/ -q
+
+  build-deb:
+    needs: [render-test, python-test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64        # 64-bit Raspberry Pi OS (Pi 3/4/5, Zero 2)
+            cc: aarch64-linux-gnu-gcc
+            pkg: gcc-aarch64-linux-gnu
+          - arch: armhf        # 32-bit Raspberry Pi OS (Pi Zero/1, 32-bit installs)
+            cc: arm-linux-gnueabihf-gcc
+            pkg: gcc-arm-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0       # git describe needs tags for the version
+      - name: Install cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg }}
+      - name: Build package
+        run: |
+          Pi/packaging/build-deb.sh ${{ matrix.arch }} ${{ matrix.cc }}
+          dpkg-deb -I laserhat_*_${{ matrix.arch }}.deb
+      - uses: actions/upload-artifact@v6
+        with:
+          name: laserhat-deb-${{ matrix.arch }}
+          path: laserhat_*_${{ matrix.arch }}.deb
+
+  # On a version tag, publish a Release with the debs + inject script.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            laserhat_*.deb Pi/packaging/inject-laserhat.sh \
+            --title "$GITHUB_REF_NAME" --generate-notes
+
+  # Ready-to-flash "golden" images: official Raspberry Pi OS Lite with the
+  # laserhat package fully installed (dependencies included, via qemu
+  # chroot) — complete offline, unlike the inject-script path which
+  # defers the apt dependencies to first boot.
+  golden-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-deb, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            image_url: https://downloads.raspberrypi.com/raspios_lite_arm64_latest
+          - arch: armhf
+            image_url: https://downloads.raspberrypi.com/raspios_lite_armhf_latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          name: laserhat-deb-${{ matrix.arch }}
+      - name: Install qemu for the ARM chroot
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static binfmt-support
+      - name: Download official Raspberry Pi OS Lite image
+        run: |
+          curl -fsSL -o raspios.img.xz '${{ matrix.image_url }}'
+          xz -d raspios.img.xz
+      - name: Grow the image so apt has room to work
+        run: |
+          truncate -s +768M raspios.img
+          sudo parted -s raspios.img resizepart 2 100%
+          LOOP=$(sudo losetup -fP --show raspios.img)
+          sudo e2fsck -pf "${LOOP}p2"
+          sudo resize2fs "${LOOP}p2"
+          sudo losetup -d "$LOOP"
+      - name: Inject laserhat (files, user, services, I2C, static IP)
+        run: sudo bash Pi/packaging/inject-laserhat.sh raspios.img laserhat_*_${{ matrix.arch }}.deb
+      - name: Install apt dependencies into the image (ARM chroot)
+        run: |
+          LOOP=$(sudo losetup -fP --show raspios.img)
+          mkdir -p rootmnt
+          sudo mount "${LOOP}p2" rootmnt
+          # Bookworm mounts the boot partition at /boot/firmware, older at /boot
+          if [ -d rootmnt/boot/firmware ]; then BOOTMNT=rootmnt/boot/firmware; else BOOTMNT=rootmnt/boot; fi
+          sudo mount "${LOOP}p1" "$BOOTMNT"
+          for fs in dev proc sys; do sudo mount --bind /$fs rootmnt/$fs; done
+          sudo cp /etc/resolv.conf rootmnt/etc/resolv.conf
+          sudo chroot rootmnt /bin/sh -c '
+            set -e
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y /var/cache/laserhat/*.deb
+            apt-get clean
+            rm -rf /var/cache/laserhat
+            systemctl disable laserhat-firstboot.service || true
+          '
+          sudo rm -f rootmnt/etc/systemd/system/multi-user.target.wants/laserhat-firstboot.service
+          for fs in dev proc sys; do sudo umount rootmnt/$fs; done
+          sudo umount "$BOOTMNT" rootmnt
+          sudo losetup -d "$LOOP"
+      - name: Compress, checksum, and Imager metadata
+        run: |
+          OUT=laserhat-raspios-lite-${{ matrix.arch }}.img
+          mv raspios.img "$OUT"
+
+          # Detect which first-boot mechanism the OS uses (Bookworm:
+          # systemd firstrun, Trixie and later: cloud-init).  Mount
+          # read-only with journal replay disabled BEFORE hashing — a
+          # normal ext4 mount writes to the image.
+          LOOP=$(sudo losetup -fP --show "$OUT")
+          mkdir -p checkmnt && sudo mount -o ro,noload "${LOOP}p2" checkmnt
+          if [ -d checkmnt/etc/cloud ]; then INIT=cloudinit; else INIT=systemd; fi
+          sudo umount checkmnt && sudo losetup -d "$LOOP"
+
+          EXTRACT_SIZE=$(stat -c%s "$OUT")
+          EXTRACT_SHA256=$(sha256sum "$OUT" | cut -d' ' -f1)
+
+          xz -T0 -6 "$OUT"
+          sha256sum "$OUT.xz" > "$OUT.xz.sha256"
+
+          jq -n \
+            --arg name "Raspberry Pi OS Lite (${{ matrix.arch }}) + LaserHAT" \
+            --arg desc "Official Raspberry Pi OS Lite with the LaserHAT stack preinstalled ($GITHUB_REF_NAME); wired port fixed at 192.168.17.10" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$OUT.xz" \
+            --arg rd "$(date +%Y-%m-%d)" --arg init "$INIT" \
+            --argjson es "$EXTRACT_SIZE" --arg esha "$EXTRACT_SHA256" \
+            --argjson ds "$(stat -c%s "$OUT.xz")" \
+            '{name:$name, description:$desc, url:$url, release_date:$rd,
+              extract_size:$es, extract_sha256:$esha, image_download_size:$ds,
+              init_format:$init}' > imager-${{ matrix.arch }}.json
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            laserhat-raspios-lite-${{ matrix.arch }}.img.xz \
+            laserhat-raspios-lite-${{ matrix.arch }}.img.xz.sha256 \
+            imager-${{ matrix.arch }}.json
+
+  # Merge the per-arch fragments into one imager.json: point Raspberry Pi
+  # Imager at Options -> Content Repository ->
+  # https://github.com/OWNER/REPO/releases/latest/download/imager.json
+  imager-repo:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: golden-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Build and publish imager.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "${{ github.repository }}" -p 'imager-*.json'
+          jq -s '{os_list: .}' imager-*.json > imager.json
+          gh release upload "$GITHUB_REF_NAME" --repo "${{ github.repository }}" imager.json
+          for f in imager-*.json; do
+            gh release delete-asset "$GITHUB_REF_NAME" "$f" --repo "${{ github.repository }}" -y
+          done
