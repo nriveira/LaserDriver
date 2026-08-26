@@ -96,14 +96,19 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           merge-multiple: true
-      - name: Create release
+      - name: Create release (or add assets to one made in the web UI)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_TAG" \
-            laserhat_*.deb Pi/packaging/inject-laserhat.sh \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG" --generate-notes
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --clobber \
+              laserhat_*.deb Pi/packaging/inject-laserhat.sh
+          else
+            gh release create "$RELEASE_TAG" \
+              laserhat_*.deb Pi/packaging/inject-laserhat.sh \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
 
   # Ready-to-flash "golden" images: official Raspberry Pi OS Lite with the
   # laserhat package fully installed (dependencies included, via qemu
