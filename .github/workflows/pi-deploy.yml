@@ -54,6 +54,8 @@ jobs:
       - name: Run Pi test suite (protocol codec, broker integration, web)
         working-directory: Pi
         run: python -m pytest tests/ -q
+      - name: C <-> Python protocol cross-check
+        run: python Firmware/host_tools/proto_crosscheck.py
 
   build-deb:
     needs: [render-test, python-test]
