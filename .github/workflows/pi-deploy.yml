@@ -17,6 +17,19 @@ on:
     paths-ignore: ['PCB/**', 'Datasheets/**', 'LaserHAT/**']
   pull_request:
     paths-ignore: ['PCB/**', 'Datasheets/**', 'LaserHAT/**']
+  # Manual run from any branch.  If release_tag is set (e.g. v0.1.0-rc1),
+  # the release/golden-image jobs run too: the release job creates that
+  # tag at the built commit server-side, so no local tag push is needed.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Create a release with this tag (empty = tests/debs only)'
+        required: false
+        default: ''
+
+# The tag being released: the pushed tag, or the dispatch input.
+env:
+  RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
 
 jobs:
   # Compile the real oledd drawing code natively and diff its output
@@ -69,9 +82,11 @@ jobs:
           name: laserhat-deb-${{ matrix.arch }}
           path: laserhat_*_${{ matrix.arch }}.deb
 
-  # On a version tag, publish a Release with the debs + inject script.
+  # On a version tag (or a manual run with release_tag set), publish a
+  # Release with the debs + inject script.  --target makes gh create the
+  # tag at this commit when it doesn't exist yet (the dispatch path).
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
     needs: build-deb
     runs-on: ubuntu-latest
     permissions:
@@ -85,16 +100,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             laserhat_*.deb Pi/packaging/inject-laserhat.sh \
-            --title "$GITHUB_REF_NAME" --generate-notes
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" --generate-notes
 
   # Ready-to-flash "golden" images: official Raspberry Pi OS Lite with the
   # laserhat package fully installed (dependencies included, via qemu
   # chroot) — complete offline, unlike the inject-script path which
   # defers the apt dependencies to first boot.
   golden-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
     needs: [build-deb, release]
     runs-on: ubuntu-latest
     permissions:
@@ -171,8 +187,8 @@ jobs:
 
           jq -n \
             --arg name "Raspberry Pi OS Lite (${{ matrix.arch }}) + LaserHAT" \
-            --arg desc "Official Raspberry Pi OS Lite with the LaserHAT stack preinstalled ($GITHUB_REF_NAME); wired port fixed at 192.168.17.10" \
-            --arg url "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$OUT.xz" \
+            --arg desc "Official Raspberry Pi OS Lite with the LaserHAT stack preinstalled ($RELEASE_TAG); wired port fixed at 192.168.17.10" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$OUT.xz" \
             --arg rd "$(date +%Y-%m-%d)" --arg init "$INIT" \
             --argjson es "$EXTRACT_SIZE" --arg esha "$EXTRACT_SHA256" \
             --argjson ds "$(stat -c%s "$OUT.xz")" \
@@ -183,7 +199,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "$RELEASE_TAG" \
             laserhat-raspios-lite-${{ matrix.arch }}.img.xz \
             laserhat-raspios-lite-${{ matrix.arch }}.img.xz.sha256 \
             imager-${{ matrix.arch }}.json
@@ -192,7 +208,7 @@ jobs:
   # Imager at Options -> Content Repository ->
   # https://github.com/OWNER/REPO/releases/latest/download/imager.json
   imager-repo:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
     needs: golden-image
     runs-on: ubuntu-latest
     permissions:
@@ -202,9 +218,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "$GITHUB_REF_NAME" --repo "${{ github.repository }}" -p 'imager-*.json'
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" -p 'imager-*.json'
           jq -s '{os_list: .}' imager-*.json > imager.json
-          gh release upload "$GITHUB_REF_NAME" --repo "${{ github.repository }}" imager.json
+          gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" imager.json
           for f in imager-*.json; do
-            gh release delete-asset "$GITHUB_REF_NAME" "$f" --repo "${{ github.repository }}" -y
+            gh release delete-asset "$RELEASE_TAG" "$f" --repo "${{ github.repository }}" -y
           done
