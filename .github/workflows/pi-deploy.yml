@@ -123,6 +123,7 @@ jobs:
     permissions:
       contents: write
     strategy:
+      fail-fast: false     # one arch failing shouldn't cancel the other
       matrix:
         include:
           - arch: arm64
@@ -134,8 +135,13 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: laserhat-deb-${{ matrix.arch }}
-      - name: Install qemu for the ARM chroot
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static binfmt-support
+      # The runner's preinstalled dynamic qemu-user binfmt handlers
+      # (arm-binfmt-P) can't run ARM binaries inside a chroot; this
+      # action replaces them with static fix-binary handlers.
+      - name: Register QEMU binfmt handlers for the ARM chroot
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm,arm64
       - name: Download official Raspberry Pi OS Lite image
         run: |
           curl -fsSL -o raspios.img.xz '${{ matrix.image_url }}'
