@@ -12,11 +12,13 @@
 [Unit]
 Description=LaserHAT OLED panel daemon (SSD1305, owns the display)
 # Start as early in boot as possible — the panel is the boot indicator.
-# No default dependencies (those would hold it until basic.target); it
-# only needs the rootfs, /run, and the i2c-dev module (and the binary
-# retries the device open, so udev timing doesn't matter).
+# No default dependencies (those would hold it until basic.target), and
+# no local-fs.target either (that waits on the boot-partition fsck):
+# oledd needs only the already-mounted rootfs, /run, and the I2C
+# modules from modules-load — and it retries the device open anyway,
+# so udev/permission timing doesn't matter.
 DefaultDependencies=no
-After=local-fs.target systemd-modules-load.service
+After=systemd-modules-load.service
 Conflicts=shutdown.target
 Before=shutdown.target
 

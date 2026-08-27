@@ -57,7 +57,14 @@ install -m 644 "$PI_DIR"/systemd/*.service "$PKG/usr/lib/systemd/system/"
 mkdir -p "$PKG/etc/NetworkManager/system-connections" "$PKG/etc/modules-load.d"
 install -m 600 "$PI_DIR/network/laserhat-eth0.nmconnection" \
     "$PKG/etc/NetworkManager/system-connections/"
-echo i2c-dev > "$PKG/etc/modules-load.d/laserhat.conf"
+cat > "$PKG/etc/modules-load.d/laserhat.conf" <<'MODS'
+# Loaded at boot by systemd-modules-load so the OLED daemon does not
+# have to wait for udev coldplug to discover the I2C bus mid-boot.
+# i2c-bcm2835 is the bus controller on Pi 0-4 (a Pi 5's designware
+# controller still arrives via udev; oledd retries until it does).
+i2c-dev
+i2c-bcm2835
+MODS
 
 # --- package metadata -------------------------------------------------------
 mkdir -p "$PKG/DEBIAN"

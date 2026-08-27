@@ -437,7 +437,8 @@ int main(void)
      * i2c-dev module has loaded or udev has set the device's group, so
      * retry the open for up to ~30 s instead of failing outright. */
     int i2c = -1;
-    for (int tries = 0; running && tries < 150; tries++) {
+    int waited = 0;
+    for (; running && waited < 150; waited++) {
         i2c = open(I2C_DEV, O_RDWR);
         if (i2c >= 0)
             break;
@@ -449,6 +450,8 @@ int main(void)
         fprintf(stderr, "Is I2C enabled? (sudo raspi-config -> Interface Options)\n");
         return 1;
     }
+    /* journald timestamps this — it marks the moment pixels can appear */
+    fprintf(stderr, "panel bus ready after %d ms\n", waited * 200);
     if (ioctl(i2c, I2C_SLAVE, I2C_ADDR) < 0) {
         perror("ioctl I2C_SLAVE");
         return 1;
