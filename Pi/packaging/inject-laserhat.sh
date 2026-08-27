@@ -155,6 +155,36 @@ if [ -f "$CMDLINE" ]; then
     sed -i 's/console=serial0,[0-9]* //g; s/console=ttyAMA0,[0-9]* //g' "$CMDLINE"
 fi
 
+# --- appliance tuning: faster boot ----------------------------------------
+# LaserHAT is a fixed-function instrument, so skip firmware probing for
+# hardware it doesn't have and mask stock services it doesn't use.
+# Rationale for every entry is in Pi/PROVISIONING.md; each mask is undone
+# with `sudo systemctl unmask <unit>`.
+
+# config.txt: no boot delay, no rainbow splash, no camera/DSI probing.
+for kv in boot_delay=0 disable_splash=1 camera_auto_detect=0 display_auto_detect=0; do
+    key=${kv%%=*}
+    if grep -q "^$key=" "$CONFIG"; then
+        sed -i "s/^$key=.*/$kv/" "$CONFIG"
+    else
+        printf '%s\n' "$kv" >> "$CONFIG"
+    fi
+done
+
+# Mask unused services (offline mask = symlink to /dev/null in /etc).
+#   ModemManager        no modem; several seconds of D-Bus probing
+#   bluetooth, hciuart  no Bluetooth; hciuart probes the BT UART for seconds
+#   triggerhappy        input-device hotkey daemon; no input devices
+#   rpi-eeprom-update   boot-time EEPROM check; run manually if ever needed
+#   dphys-swapfile      swap creation/validation; the stack fits in RAM
+#   NetworkManager-wait-online  nothing here needs network-online.target
+for unit in ModemManager.service bluetooth.service hciuart.service \
+            triggerhappy.service triggerhappy.socket \
+            rpi-eeprom-update.service dphys-swapfile.service \
+            NetworkManager-wait-online.service; do
+    ln -sf /dev/null "$ROOT_MNT/etc/systemd/system/$unit"
+done
+
 sync
 echo "done: laserhat installed and enabled."
 echo "First boot: OLED shows hostname + IPs immediately; broker/web come up"

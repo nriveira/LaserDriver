@@ -24,6 +24,12 @@ plus apt packages (`python3-serial`, `python3-flask`, `python3-gpiozero`,
 `python3-lgpio`); the OLED stack (adafruit-blinka / Pillow) is replaced
 by `oledd.c`.
 
+**[PROVISIONING.md](PROVISIONING.md)** is the authoritative reference
+for every change the deployment makes to a stock Raspberry Pi OS system
+(package contents, services, network, boot config, masked units) and
+the rationale for each — keep it updated in the same commit as any
+provisioning change.
+
 ## Networking
 
 The Debian package fixes the **wired port at `192.168.17.10/24` with no
