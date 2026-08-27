@@ -433,7 +433,17 @@ int main(void)
     if (!sock_path || !*sock_path)
         sock_path = DEFAULT_SOCK;
 
-    int i2c = open(I2C_DEV, O_RDWR);
+    /* The unit starts very early in boot (sysinit), possibly before the
+     * i2c-dev module has loaded or udev has set the device's group, so
+     * retry the open for up to ~30 s instead of failing outright. */
+    int i2c = -1;
+    for (int tries = 0; running && tries < 150; tries++) {
+        i2c = open(I2C_DEV, O_RDWR);
+        if (i2c >= 0)
+            break;
+        struct timespec ms200 = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
+        nanosleep(&ms200, NULL);
+    }
     if (i2c < 0) {
         perror("open " I2C_DEV);
         fprintf(stderr, "Is I2C enabled? (sudo raspi-config -> Interface Options)\n");

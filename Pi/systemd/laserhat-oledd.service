@@ -11,6 +11,14 @@
 
 [Unit]
 Description=LaserHAT OLED panel daemon (SSD1305, owns the display)
+# Start as early in boot as possible — the panel is the boot indicator.
+# No default dependencies (those would hold it until basic.target); it
+# only needs the rootfs, /run, and the i2c-dev module (and the binary
+# retries the device open, so udev timing doesn't matter).
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=simple
@@ -22,10 +30,10 @@ RuntimeDirectory=laserhat-oled
 RuntimeDirectoryMode=0755
 Environment=LASERHAT_OLED_SOCK=/run/laserhat-oled/oled.sock
 ExecStart=/usr/bin/laserhat-oledd
-Restart=on-failure
+Restart=always
 RestartSec=2
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target

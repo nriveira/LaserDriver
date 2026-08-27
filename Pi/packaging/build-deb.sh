@@ -102,8 +102,15 @@ for unit in $UNITS; do
     if command -v deb-systemd-helper >/dev/null; then
         deb-systemd-helper enable "\$unit" >/dev/null || true
     else
+        # Fallback matches each unit's [Install] WantedBy target
+        # (laserhat-oledd starts at sysinit for an early display).
+        case "\$unit" in
+            laserhat-oledd.service) tgt=sysinit.target ;;
+            *)                      tgt=multi-user.target ;;
+        esac
+        mkdir -p "/etc/systemd/system/\$tgt.wants"
         ln -sf "/usr/lib/systemd/system/\$unit" \\
-            "/etc/systemd/system/multi-user.target.wants/\$unit"
+            "/etc/systemd/system/\$tgt.wants/\$unit"
     fi
 done
 

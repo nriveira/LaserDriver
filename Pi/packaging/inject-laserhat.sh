@@ -100,8 +100,12 @@ if ! grep -q '^laserhat:' "$ROOT_MNT/etc/passwd"; then
 fi
 
 # --- rootfs: enable the services (symlinks; no systemd needed here) --------
-mkdir -p "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
-for unit in laserhat-oledd laserhat-broker oled-gui laserhat-web; do
+# oledd starts at sysinit so the display is on early; the rest at multi-user.
+mkdir -p "$ROOT_MNT/etc/systemd/system/sysinit.target.wants" \
+         "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
+ln -sf /usr/lib/systemd/system/laserhat-oledd.service \
+       "$ROOT_MNT/etc/systemd/system/sysinit.target.wants/laserhat-oledd.service"
+for unit in laserhat-broker oled-gui laserhat-web; do
     ln -sf "/usr/lib/systemd/system/$unit.service" \
            "$ROOT_MNT/etc/systemd/system/multi-user.target.wants/$unit.service"
 done
