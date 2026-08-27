@@ -139,6 +139,18 @@ elif ! grep -q '^dtparam=i2c_arm=on' "$CONFIG"; then
     printf '\ndtparam=i2c_arm=on\n' >> "$CONFIG"
 fi
 
+# --- boot partition: give the broker its UART ------------------------------
+# The broker owns /dev/ttyS0 for the MCU link, so the UART must exist
+# (enable_uart=1) and the kernel console must be off it (drop
+# console=serial0,... from cmdline.txt).
+if ! grep -q '^enable_uart=1' "$CONFIG"; then
+    printf 'enable_uart=1\n' >> "$CONFIG"
+fi
+CMDLINE=$BOOT_MNT/cmdline.txt
+if [ -f "$CMDLINE" ]; then
+    sed -i 's/console=serial0,[0-9]* //g; s/console=ttyAMA0,[0-9]* //g' "$CMDLINE"
+fi
+
 sync
 echo "done: laserhat installed and enabled."
 echo "First boot: OLED shows hostname + IPs immediately; broker/web come up"

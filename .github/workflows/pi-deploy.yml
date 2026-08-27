@@ -224,7 +224,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$RELEASE_TAG" \
+          gh release upload "$RELEASE_TAG" --clobber \
             laserhat-raspios-lite-${{ matrix.arch }}.img.xz \
             laserhat-raspios-lite-${{ matrix.arch }}.img.xz.sha256 \
             imager-${{ matrix.arch }}.json
@@ -245,7 +245,7 @@ jobs:
         run: |
           gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" -p 'imager-*.json'
           jq -s '{os_list: .}' imager-*.json > imager.json
-          gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" imager.json
+          gh release upload "$RELEASE_TAG" --clobber --repo "${{ github.repository }}" imager.json
           for f in imager-*.json; do
             gh release delete-asset "$RELEASE_TAG" "$f" --repo "${{ github.repository }}" -y
           done
