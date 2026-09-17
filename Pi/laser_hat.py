@@ -35,6 +35,9 @@ class State:
     mode: int = 0           # 0 = LASER, 1 = ESTIM
     estim_dur_ticks: int = proto.ESTIM_TICKS_MIN   # 100 kHz ticks (10–10000 µs)
     estim_ipi_ticks: int = proto.ESTIM_TICKS_MIN
+    train_count: int = 1        # pulses per trigger; 0 = until abort
+    train_period_ms: int = 1000 # ms between pulse starts
+    train_done: int = 0         # pulses started in the current / last train
 
     def button(self, n: int) -> bool:
         """True if button n (1..4) is pressed."""
@@ -100,7 +103,11 @@ def _main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("query")
     sub.add_parser("trigger")
+    sub.add_parser("abort", help="stop the running pulse / train")
     sub.add_parser("watch", help="print every frame until Ctrl-C")
+    tp = sub.add_parser("train", help="set pulse-train count (0 = until abort) and period (ms)")
+    tp.add_argument("count", type=int)
+    tp.add_argument("period_ms", type=int)
     sp = sub.add_parser("config", help="set intensity ramp hold at once")
     sp.add_argument("intensity", type=int)
     sp.add_argument("ramp", type=int)
@@ -123,6 +130,13 @@ def _main() -> int:
     elif args.cmd == "trigger":
         uart.send(proto.CMD_TRIGGER)
         print(wait_status() or "no response")    # status echo is the ack
+    elif args.cmd == "abort":
+        uart.send(proto.CMD_ABORT)
+        print(wait_status() or "no response")
+    elif args.cmd == "train":
+        period = proto.avoid_magic(args.period_ms, proto.TRAIN_PERIOD_MAX)
+        uart.send(proto.CMD_TRAIN_CONFIG, proto._TRAIN_CONFIG.pack(args.count, period))
+        print(wait_status() or "no response")
     elif args.cmd == "config":
         r = proto.avoid_magic(args.ramp)
         h = proto.avoid_magic(args.hold)

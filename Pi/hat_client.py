@@ -35,6 +35,9 @@ def _state_from_msg(msg: dict) -> Optional[State]:
         mode=msg.get("mode", 0),
         estim_dur_ticks=msg.get("estim_dur_ticks", 1),
         estim_ipi_ticks=msg.get("estim_ipi_ticks", 1),
+        train_count=msg["train_count"] if msg.get("train_count") is not None else 1,
+        train_period_ms=msg.get("train_period_ms") or 1000,
+        train_done=msg.get("train_done", 0),
     )
 
 
@@ -134,8 +137,20 @@ class HatClient:
     def set_estim_ipi(self, ticks: int) -> bool:
         return self._command({"cmd": "set", "knob": "ei", "value": ticks}).get("ok", False)
 
+    def set_train_count(self, count: int) -> bool:
+        """Pulses per trigger; 0 = repeat until abort()."""
+        return self._command({"cmd": "set", "knob": "tn", "value": count}).get("ok", False)
+
+    def set_train_period(self, period_ms: int) -> bool:
+        """Milliseconds between pulse starts within a train."""
+        return self._command({"cmd": "set", "knob": "tp", "value": period_ms}).get("ok", False)
+
     def trigger(self) -> bool:
         return self._command({"cmd": "trigger"}).get("ok", False)
+
+    def abort(self) -> bool:
+        """Stop the running pulse / train."""
+        return self._command({"cmd": "abort"}).get("ok", False)
 
     def trigger_gpio(self) -> bool:
         return self._command({"cmd": "trigger_gpio"}).get("ok", False)

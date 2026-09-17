@@ -70,6 +70,35 @@ def run() -> int:
         if resp.status_code != 200:
             failures.append(f"trigger_gpio status {resp.status_code}")
 
+        # Train knobs + abort route.
+        r = c.post("/api/set/tn", json={"value": 4}).get_json()
+        if not r.get("ok"):
+            failures.append(f"set tn failed: {r}")
+        r = c.post("/api/set/tp", json={"value": 500}).get_json()
+        if not r.get("ok"):
+            failures.append(f"set tp failed: {r}")
+        if not _wait(lambda: (lambda s: (s.get("train_count"), s.get("train_period_ms")))
+                     (c.get("/api/state").get_json()) == (4, 500)):
+            failures.append("train knobs not reflected via /api/state")
+        r = c.post("/api/set/tp", json={"value": 1}).get_json()
+        if r.get("ok"):
+            failures.append("out-of-range train period wrongly ok")
+        if not _wait(lambda: c.get("/api/state").get_json().get("phase") == "W"):
+            failures.append("phase never idle before train")
+        r = c.post("/api/trigger").get_json()
+        if not r.get("ok"):
+            failures.append(f"train trigger failed: {r}")
+        if not _wait(lambda: c.get("/api/state").get_json().get("phase") in ("T", "G")):
+            failures.append("train did not start")
+        r = c.post("/api/abort").get_json()
+        if not r.get("ok"):
+            failures.append(f"abort failed: {r}")
+        if not _wait(lambda: c.get("/api/state").get_json().get("phase") == "W"):
+            failures.append("abort did not return phase to W")
+        page = c.get("/").get_data(as_text=True)
+        if 'id="abort"' not in page or 'data-knob="tn"' not in page:
+            failures.append("index page missing train controls")
+
         client.close()
     finally:
         broker.terminate(); fake.terminate()
@@ -83,7 +112,8 @@ def run() -> int:
         for f in failures:
             print("FAIL:", f)
         return 1
-    print("web OK: state, set+mirror, range-reject, trigger, trigger_gpio route")
+    print("web OK: state, set+mirror, range-reject, trigger, trigger_gpio route, "
+          "train knobs, abort")
     return 0
 
 

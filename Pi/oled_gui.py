@@ -6,19 +6,23 @@ web GUI.  Button presses arrive as EVT_BUTTON broadcasts; state arrives
 as broadcast snapshots — no polling.
 
 Button mapping (LaserHAT hardware buttons, reported by MCU):
-    B1  trigger pulse — firmware fires on release.
-    B2  cycle selected row (laser: i→r→h→[mode]; estim: dur→IPI→[mode])
-    B3  decrement selected value  (on [mode] row: no-op on −)
-    B4  increment selected value  (on [mode] row: toggle LASER↔ESTIM)
+    B1  trigger a pulse train — firmware fires on release; while a
+        multi-pulse train is running, B1 stops it instead.
+    B2  cycle selected row (laser: i→r→h→n→T→[mode]; estim: dur→IPI→n→T→[mode])
+    B3  decrement selected value  (on [mode] row: switch to LASER)
+    B4  increment selected value  (on [mode] row: switch to ESTIM)
 
 Display layout (128×32, font 8px → 4 rows):
-    Row 0  header: "LaserHAT[L|E]"  +  IP (right-aligned if it fits)
+    Row 0  header: "LaserHAT[L|E]"  +  IP right-aligned (or "k/n" train
+           progress while a train is running)
     Row 1  ┐
     Row 2  ├  3-row scrolling window over the selectable items
-    Row 3  ┘  phase chip (WAIT/TRIG) pinned to bottom-right corner
+    Row 3  ┘  phase chip (WAIT/TRIG/GAP) pinned to bottom-right corner
 
-In LASER mode the selectable items are: i, r, h, [mode]
-In ESTIM mode the selectable items are: dur (ed), IPI (ei), [mode]
+In LASER mode the selectable items are: i, r, h, n, T, [mode]
+In ESTIM mode the selectable items are: dur (ed), IPI (ei), n, T, [mode]
+  n = train count (pulses per trigger, 0 = "inf" until stopped)
+  T = train period (seconds between pulse starts)
 The window scrolls so the selected item is always visible.
 """
 
@@ -36,7 +40,7 @@ from PIL import ImageDraw, ImageFont
 from oled_panel import OledPanel
 from hat_client import DEFAULT_SOCKET, HatClient
 from laser_hat import State
-from params import ESTIM_PARAMS, PARAMS
+from params import ESTIM_PARAMS, PARAMS, TRAIN_PARAMS
 
 
 # --------------------------------------------------------------- config
@@ -71,8 +75,8 @@ def load_font(size: int) -> ImageFont.ImageFont:
 def _items_for(state: State) -> list:
     """Ordered selectable items for the current mode (params + mode sentinel)."""
     if state.mode == 1:     # ESTIM
-        return list(ESTIM_PARAMS) + [_MODE_ITEM]
-    return list(PARAMS) + [_MODE_ITEM]
+        return list(ESTIM_PARAMS) + list(TRAIN_PARAMS) + [_MODE_ITEM]
+    return list(PARAMS) + list(TRAIN_PARAMS) + [_MODE_ITEM]
 
 
 def _value_for(state: State, name: str) -> int:
@@ -82,6 +86,8 @@ def _value_for(state: State, name: str) -> int:
         "h":  state.hold_ticks,
         "ed": state.estim_dur_ticks,
         "ei": state.estim_ipi_ticks,
+        "tn": state.train_count,
+        "tp": state.train_period_ms,
     }[name]
 
 
@@ -92,6 +98,8 @@ def _set_for(client: HatClient, name: str):
         "h":  client.set_hold,
         "ed": client.set_estim_dur,
         "ei": client.set_estim_ipi,
+        "tn": client.set_train_count,
+        "tp": client.set_train_period,
     }[name]
 
 
@@ -101,7 +109,21 @@ _FMT = {
     "h":  lambda v: f"{v}({v/100:.0f}ms)",
     "ed": lambda v: f"{v * 10}us",
     "ei": lambda v: f"{v * 10}us",
+    "tn": lambda v: "inf" if v == 0 else str(v),
+    "tp": lambda v: f"{v / 1000:g}s",
 }
+
+# Item names are the knob letters; give the train rows short labels so
+# "n:10" / "T:5s" fit beside the phase chip.
+_ROW_LABEL = {"tn": "n", "tp": "T"}
+
+
+def _progress(state: State) -> str:
+    """'k/n' while a multi-pulse train is running, else ''."""
+    if state.phase == "W" or state.train_count == 1:
+        return ""
+    total = "inf" if state.train_count == 0 else str(state.train_count)
+    return f"{state.train_done}/{total}"
 
 
 # --------------------------------------------------------------- helpers
@@ -140,14 +162,16 @@ def render(
     font = load_font(8)
     ON, OFF = 1, 0
 
-    # Header: brand with mode tag [L]/[E], IP right-aligned if it fits.
+    # Header: brand with mode tag [L]/[E]; right side is the train progress
+    # while a train runs, otherwise the IP (if it fits).
     mode_tag = "E" if state.mode == 1 else "L"
     brand = f"LaserHAT[{mode_tag}]"
     draw.text((0, 0), brand, fill=ON, font=font)
     brand_w = draw.textlength(brand, font=font)
-    ip_w = draw.textlength(ip, font=font)
-    if brand_w + 4 + ip_w <= W:
-        draw.text((W - ip_w, 0), ip, fill=ON, font=font)
+    right = _progress(state) or ip
+    right_w = draw.textlength(right, font=font)
+    if brand_w + 4 + right_w <= W:
+        draw.text((W - right_w, 0), right, fill=ON, font=font)
 
     # 3-row scrolling window over selectable items.
     items = _items_for(state)
@@ -163,16 +187,17 @@ def render(
             mode_str = "ESTIM" if state.mode == 1 else "LASER"
             text = f"{prefix}[mode:{mode_str}]"
         else:
-            text = f"{prefix}{item.name}:{_FMT[item.name](_value_for(state, item.name))}"
+            label = _ROW_LABEL.get(item.name, item.name)
+            text = f"{prefix}{label}:{_FMT[item.name](_value_for(state, item.name))}"
         draw.text((0, base_y + row_i * row_h), text, fill=ON, font=font)
 
     # Phase chip pinned to bottom-right, drawn over the tail of the last row.
-    phase_label = "TRIG" if state.phase == "T" else "WAIT"
+    phase_label = {"T": "TRIG", "G": "GAP"}.get(state.phase, "WAIT")
     cw = int(draw.textlength(phase_label, font=font)) + 5
     x0 = W - cw
     y0 = base_y + (n_vis - 1) * row_h
     draw.rectangle((x0 - 2, y0 - 1, W, H), fill=OFF)
-    if state.phase == "T":
+    if state.phase != "W":
         draw.rectangle((x0, y0, W - 1, H - 1), fill=ON)
         draw.text((x0 + 3, y0), phase_label, fill=OFF, font=font)
     else:
@@ -248,6 +273,7 @@ def main() -> int:
         state.intensity, state.ramp_ticks, state.hold_ticks,
         state.phase, selected, ip,
         state.mode, state.estim_dur_ticks, state.estim_ipi_ticks,
+        state.train_count, state.train_period_ms, state.train_done,
     )
     last_ip_check = time.monotonic()
 
@@ -280,6 +306,7 @@ def main() -> int:
             state.intensity, state.ramp_ticks, state.hold_ticks,
             state.phase, selected, ip,
             state.mode, state.estim_dur_ticks, state.estim_ipi_ticks,
+            state.train_count, state.train_period_ms, state.train_done,
         )
         if key != last_painted_key and (now - last_press_at) >= SETTLE_GAP:
             render(panel, state, selected, ip, hostname)

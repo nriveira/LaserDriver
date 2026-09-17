@@ -21,20 +21,29 @@
  * everything else: UART parsing can take as long as it likes without
  * shifting a single PWM-duty write.
  *
- * Triggers are mediated through three volatile flags consumed (and
- * cleared) by the tick ISR at the start of each tick:
+ * Triggers are mediated through volatile flags consumed (and cleared) by
+ * the tick ISR at the start of each tick:
  *
- *   g_uart_trigger_pending      set by the UART parser on 't'
+ *   g_uart_trigger_pending      set by the UART parser on CMD_TRIGGER
  *   g_button_trigger_pending    set by main loop on BUTTON1 release
  *   g_hw_trigger_pending        set by the BNC / Pi-GPIO edge ISR
  *                               (GROUP1_IRQHandler)
+ *   g_abort_pending             set by the parser on CMD_ABORT, or by
+ *                               BUTTON1 release while a train is running
  *
- * Pulse events (EVT_PULSE_START / EVT_PULSE_END) are emitted from the
- * main loop on PulseEvent records the ISR fills at the WAITING<->TRIGGERED
- * edges, so the blocking UART frame writes stay out of interrupt context.
- * Events are emitted for *every* pulse regardless of trigger source: the
- * host is a broker that reads all typed frames and routes them by type, so
- * there's no per-source ACK gating to get wrong.
+ * A trigger starts a *pulse train*: `train.count` pulses (0 = until
+ * abort) spaced `train.period_ticks` between pulse starts.  Between pulses
+ * the machine sits in OVERALL_TRAIN_GAP with the outputs safe; if the
+ * period is shorter than a pulse the next one starts on the tick after the
+ * previous ends (there is always >= 1 safe tick between pulses).  The
+ * default train (count 1) is exactly the old single-pulse behaviour.
+ *
+ * Pulse events (EVT_PULSE_START / EVT_PULSE_END / EVT_TRAIN_END) are
+ * emitted from the main loop out of a small ordered ring the ISR fills at
+ * the phase edges, so the blocking UART frame writes stay out of interrupt
+ * context.  Events are emitted for *every* pulse regardless of trigger
+ * source: the host is a broker that reads all typed frames and routes them
+ * by type, so there's no per-source ACK gating to get wrong.
  *
  * Wire protocol is binary, magic-word framed; see protocol.h / framing.h
  * and the host mirror Pi/protocol.py.  The UART RX ISR still just pushes
@@ -45,7 +54,9 @@
  * with one aligned store (atomic on M0+), and the ISR copies the struct
  * field-by-field at latch time, so no field is ever torn.  The latch is
  * the consistency point: a pulse uses whatever fields are live when it
- * triggers.
+ * starts — for a train, each pulse latches afresh.  The train parameters
+ * themselves are read live by the ISR (single aligned loads), so editing
+ * count / period mid-train takes effect at the next pulse boundary.
  * ----------------------------------------------------------------------- */
 
 #define PWM_PERIOD_COUNTS       320u
@@ -89,6 +100,20 @@ static volatile EstimConfig g_estim_config_live = {
 };
 static EstimConfig g_estim_config_active;   /* ISR-only */
 
+/* Pulse-train parameters.  Read live by the ISR (no latch): each field is
+ * a single aligned store from the parser, so a read can't tear. */
+typedef struct {
+    uint32_t period_ticks;    /* pulse-start to pulse-start */
+    uint32_t period_ms;       /* same value as sent, for the STATUS echo */
+    uint16_t count;           /* 0 = until abort */
+} TrainConfig;
+
+static volatile TrainConfig g_train_live = {
+    .period_ticks = TRAIN_PERIOD_DEFAULT * 100u,
+    .period_ms    = TRAIN_PERIOD_DEFAULT,
+    .count        = TRAIN_COUNT_DEFAULT,
+};
+
 static volatile uint8_t g_mode = MODE_LASER;
 static          uint8_t g_mode_active;      /* ISR-only, latched at trigger */
 
@@ -113,7 +138,8 @@ static          uint8_t g_mode_active;      /* ISR-only, latched at trigger */
 
 typedef enum {
     OVERALL_WAITING,
-    OVERALL_TRIGGERED,
+    OVERALL_TRIGGERED,      /* a pulse is in progress */
+    OVERALL_TRAIN_GAP,      /* between pulses of a train; outputs safe */
 } OverallPhase;
 
 /* Pulse shape: ramp the duty up to `intensity` over the ramp window, hold
@@ -138,7 +164,9 @@ typedef struct {
     LaserPhase   laser;
     EstimPhase   estim;
     uint32_t     ramp_step;
-    uint32_t     tick_count;
+    uint32_t     tick_count;    /* ticks in the current sub-phase */
+    uint32_t     period_count;  /* ticks since the current pulse started */
+    uint16_t     train_done;    /* pulses started in this train */
 } MachineState;
 
 typedef enum {
@@ -150,8 +178,8 @@ typedef enum {
  * Cross-context globals
  * ----------------------------------------------------------------------- */
 
-/* Pulse state — written only by TIMG0 ISR.  Main only reads .overall
- * (one word, atomic on M0+) for the ? response. */
+/* Pulse state — written only by TIMG0 ISR.  Main only reads .overall and
+ * .train_done (each one aligned load, atomic on M0+) for RSP_STATUS. */
 static volatile MachineState g_state = {
     .overall = OVERALL_WAITING,
     .laser   = LASER_IDLE,
@@ -163,18 +191,26 @@ static volatile uint32_t     g_isr_ticks = 0u;
 static volatile bool g_uart_trigger_pending   = false;
 static volatile bool g_button_trigger_pending = false;
 static volatile bool g_hw_trigger_pending     = false;
+static volatile bool g_abort_pending          = false;
 
-/* Per-pulse event record handed from the ISR (which fills it at a phase
- * transition) to the main loop's blocking UART TX path (which drains it).
- * Write the payload (tick) *before* setting .pending, so a reader that
- * observes .pending is guaranteed to also see the matching tick. */
+/* Pulse-event ring handed from the ISR (producer, at phase edges) to the
+ * main loop's blocking UART TX path (consumer).  Single producer / single
+ * consumer: the ISR writes only .head, main writes only .tail, and each
+ * index is one byte, so no locking is needed.  The ISR fills the entry
+ * *before* advancing .head, so a reader that sees a new head also sees
+ * the entry.  Ordered, so END / next START / TRAIN_END emitted from the
+ * same tick go out in the order they happened.  8 deep: pulse starts are
+ * >= TRAIN_PERIOD_MIN (10 ms) apart and main drains at 1 kHz, so at most
+ * a few entries are ever queued. */
 typedef struct {
+    uint8_t  type;      /* EVT_PULSE_START / EVT_PULSE_END / EVT_TRAIN_END */
     uint32_t tick;
-    bool     pending;
 } PulseEvent;
 
-static volatile PulseEvent g_pulse_start_evt = { 0u, false };
-static volatile PulseEvent g_pulse_end_evt   = { 0u, false };
+#define EVT_RING_SIZE   8u   /* power of two */
+static volatile PulseEvent g_evt_ring[EVT_RING_SIZE];
+static volatile uint8_t    g_evt_head = 0u;   /* ISR-owned */
+static volatile uint8_t    g_evt_tail = 0u;   /* main-owned */
 
 /* Button state — owned by main loop. */
 static BtnPhase g_btn_phase[NUM_BUTTONS];
@@ -238,35 +274,116 @@ static inline void latch_config_from_live(void)
     g_mode_active = g_mode;
 }
 
+/* ISR-side event producer.  Drops the event if the ring is full (can't
+ * happen at the documented rates; the periodic STATUS poll self-heals the
+ * host's view anyway). */
+static inline void push_event(uint8_t type)
+{
+    uint8_t head = g_evt_head;
+    uint8_t next = (uint8_t)((head + 1u) & (EVT_RING_SIZE - 1u));
+    if (next != g_evt_tail) {
+        g_evt_ring[head].type = type;
+        g_evt_ring[head].tick = g_isr_ticks;
+        g_evt_head = next;
+    }
+}
+
+/* Start one pulse (the first of a train, or the next one).  Latches the
+ * pulse config live *now*, so each pulse of a train picks up edits. */
+static inline void start_pulse(void)
+{
+    latch_config_from_live();
+    g_state.overall      = OVERALL_TRIGGERED;
+    g_state.tick_count   = 0u;
+    g_state.period_count = 0u;
+    if (g_mode_active == MODE_ESTIM) {
+        g_state.estim = ESTIM_PULSE1;
+    } else {
+        g_state.laser     = LASER_RAMP_UP;
+        g_state.ramp_step = 0u;
+    }
+    if (g_state.train_done != 0xFFFFu) {   /* saturate for count-0 trains */
+        g_state.train_done++;
+    }
+    push_event(EVT_PULSE_START);
+}
+
+/* Put the sub-phases back to idle (outputs go safe this tick). */
+static inline void reset_pulse_phases(void)
+{
+    g_state.laser      = LASER_IDLE;
+    g_state.estim      = ESTIM_IDLE;
+    g_state.ramp_step  = 0u;
+    g_state.tick_count = 0u;
+}
+
+/* The train is over (all pulses done, or aborted): back to WAITING. */
+static inline void end_train(void)
+{
+    reset_pulse_phases();
+    g_state.overall = OVERALL_WAITING;
+    push_event(EVT_TRAIN_END);
+}
+
+/* A pulse just completed.  Decide whether the train continues.  We always
+ * pass through OVERALL_TRAIN_GAP for at least one tick so consecutive
+ * pulses can't merge (e.g. EStim PULSE2 -> PULSE1 with PA13 never falling);
+ * the GAP case below starts the next pulse as soon as the period elapses. */
+static inline void end_pulse(void)
+{
+    reset_pulse_phases();
+    push_event(EVT_PULSE_END);
+
+    uint16_t count = g_train_live.count;
+    if (count != 0u && g_state.train_done >= count) {
+        end_train();
+    } else {
+        g_state.overall = OVERALL_TRAIN_GAP;
+    }
+}
+
 static inline void state_machine_tick(void)
 {
     /* --- Combine trigger sources --- */
     bool trigger = g_uart_trigger_pending || g_button_trigger_pending
                    || g_hw_trigger_pending;
+    bool abort   = g_abort_pending;
     g_uart_trigger_pending   = false;
     g_button_trigger_pending = false;
     g_hw_trigger_pending     = false;
+    g_abort_pending          = false;
+
+    /* --- Abort: stop immediately, outputs safe this tick.  A trigger in
+     * the same tick is dropped rather than restarting the train. --- */
+    if (abort) {
+        trigger = false;
+        if (g_state.overall == OVERALL_TRIGGERED) {
+            push_event(EVT_PULSE_END);     /* the cut-short pulse */
+            end_train();
+        } else if (g_state.overall == OVERALL_TRAIN_GAP) {
+            end_train();
+        }
+    }
 
     /* --- Overall + laser phases --- */
     switch (g_state.overall) {
         case OVERALL_WAITING:
             if (trigger) {
-                latch_config_from_live();
-                g_state.overall    = OVERALL_TRIGGERED;
-                g_state.tick_count = 0u;
-                if (g_mode_active == MODE_ESTIM) {
-                    g_state.estim = ESTIM_PULSE1;
-                } else {
-                    g_state.laser     = LASER_RAMP_UP;
-                    g_state.ramp_step = 0u;
-                }
-                g_pulse_start_evt.tick    = g_isr_ticks;
-                g_pulse_start_evt.pending = true;
+                g_state.train_done = 0u;
+                start_pulse();
+            }
+            break;
+
+        case OVERALL_TRAIN_GAP:
+            g_state.period_count++;
+            if (g_state.period_count >= g_train_live.period_ticks) {
+                start_pulse();
             }
             break;
 
         case OVERALL_TRIGGERED:
             g_state.tick_count++;
+            g_state.period_count++;
             if (g_mode_active == MODE_ESTIM) {
                 switch (g_state.estim) {
                     case ESTIM_PULSE1:
@@ -285,10 +402,7 @@ static inline void state_machine_tick(void)
 
                     case ESTIM_PULSE2:
                         if (g_state.tick_count >= g_estim_config_active.pulse_dur_ticks) {
-                            g_state.estim   = ESTIM_IDLE;
-                            g_state.overall = OVERALL_WAITING;
-                            g_pulse_end_evt.tick    = g_isr_ticks;
-                            g_pulse_end_evt.pending = true;
+                            end_pulse();
                         }
                         break;
 
@@ -310,12 +424,7 @@ static inline void state_machine_tick(void)
 
                     case LASER_HOLD_HIGH:
                         if (g_state.tick_count >= g_config_active.hold_ticks) {
-                            g_state.tick_count = 0u;
-                            g_state.ramp_step  = 0u;
-                            g_state.laser      = LASER_IDLE;
-                            g_state.overall    = OVERALL_WAITING;
-                            g_pulse_end_evt.tick    = g_isr_ticks;
-                            g_pulse_end_evt.pending = true;
+                            end_pulse();
                         }
                         break;
 
@@ -334,8 +443,8 @@ static inline void set_output_from_state(void)
     uint16_t duty   = 0u;      /* only meaningful when pwm */
     bool     mirror = false;   /* STIM_MIRROR (PA13) on */
 
-    if (g_state.overall == OVERALL_WAITING) {
-        /* defaults: gpio-safe, mirror off */
+    if (g_state.overall != OVERALL_TRIGGERED) {
+        /* WAITING or TRAIN_GAP: gpio-safe, mirror off */
     } else if (g_mode_active == MODE_ESTIM) {
         /* EStim: PA13 tracks the pulse pair; laser pins always stay safe. */
         mirror = (g_state.estim == ESTIM_PULSE1 || g_state.estim == ESTIM_PULSE2);
@@ -415,8 +524,16 @@ static void poll_buttons(void)
                 } else {
                     g_btn_mask &= (uint8_t)~(1u << n);
                     if (n == 0u) {
-                        /* BUTTON1 release fires a pulse. */
-                        g_button_trigger_pending = true;
+                        /* BUTTON1 release fires a pulse train.  While a
+                         * multi-pulse train is running it stops it
+                         * instead.  With the default count of 1 a press
+                         * mid-pulse is ignored, exactly as before. */
+                        if (g_state.overall != OVERALL_WAITING
+                                && g_train_live.count != 1u) {
+                            g_abort_pending = true;
+                        } else {
+                            g_button_trigger_pending = true;
+                        }
                     }
                 }
             }
@@ -442,10 +559,16 @@ static void poll_buttons(void)
  * map and Pi/protocol.py for the host mirror.  The RX ISR pushes bytes
  * into a ring; this code feeds them to the frame decoder.
  *
- *   CMD_CONFIG  i,r,h  -> RSP_STATUS    (status-as-ack)
- *   CMD_TRIGGER        -> RSP_STATUS, then EVT_PULSE_START/_END
- *   CMD_QUERY          -> RSP_STATUS
- *   (async)            -> EVT_BUTTON on any debounced button change
+ *   CMD_CONFIG  i,r,h     -> RSP_STATUS    (status-as-ack)
+ *   CMD_TRIGGER           -> RSP_STATUS, then per pulse EVT_PULSE_START/_END
+ *                            and EVT_TRAIN_END once the train is over
+ *   CMD_QUERY             -> RSP_STATUS
+ *   CMD_SET_MODE  m       -> RSP_STATUS (ignored while a train is running)
+ *   CMD_ESTIM_CONFIG d,i  -> RSP_STATUS
+ *   CMD_TRAIN_CONFIG n,p  -> RSP_STATUS
+ *   CMD_ABORT             -> RSP_STATUS, then EVT_PULSE_END (if mid-pulse)
+ *                            + EVT_TRAIN_END
+ *   (async)               -> EVT_BUTTON on any debounced button change
  *
  * Every command is answered with RSP_STATUS, so the host confirms the
  * resulting state end-to-end — that echo is the integrity check; there is
@@ -465,6 +588,15 @@ static void tx_frame(uint8_t type, const uint8_t *payload, size_t len)
     }
 }
 
+static uint8_t phase_byte(void)
+{
+    switch (g_state.overall) {
+        case OVERALL_TRIGGERED: return PHASE_TRIGGERED;
+        case OVERALL_TRAIN_GAP: return PHASE_TRAIN_GAP;
+        default:                return PHASE_WAITING;
+    }
+}
+
 static void emit_status(void)
 {
     StatusPayload s = {
@@ -472,14 +604,30 @@ static void emit_status(void)
         .ramp_ticks       = g_config_live.ramp_ticks,
         .hold_ticks       = g_config_live.hold_ticks,
         .button_mask      = g_btn_mask,
-        .phase = (g_state.overall == OVERALL_WAITING) ? PHASE_WAITING
-                                                      : PHASE_TRIGGERED,
+        .phase            = phase_byte(),
         .tick             = g_isr_ticks,
         .mode             = g_mode,
         .estim_dur_ticks  = g_estim_config_live.pulse_dur_ticks,
         .estim_ipi_ticks  = g_estim_config_live.ipi_ticks,
+        .train_count      = g_train_live.count,
+        .train_period_ms  = g_train_live.period_ms,
+        .train_done       = g_state.train_done,
     };
     tx_frame(RSP_STATUS, (const uint8_t *)&s, sizeof s);
+}
+
+static void apply_train_config(const uint8_t *payload)
+{
+    const TrainConfigPayload *c = (const TrainConfigPayload *)payload;
+    if (c->count > TRAIN_COUNT_MAX ||
+        c->period_ms < TRAIN_PERIOD_MIN || c->period_ms > TRAIN_PERIOD_MAX) {
+        return;
+    }
+    /* Each field is one aligned store; the ISR reads them individually at
+     * pulse boundaries, so a mid-train edit is picked up cleanly. */
+    g_train_live.count        = c->count;
+    g_train_live.period_ms    = c->period_ms;
+    g_train_live.period_ticks = c->period_ms * 100u;   /* 100 kHz tick */
 }
 
 static void apply_estim_config(const uint8_t *payload)
@@ -540,7 +688,11 @@ static void process_frame(uint8_t type, const uint8_t *payload, size_t len)
             break;
 
         case CMD_SET_MODE:
-            if (len == CMD_SET_MODE_LEN) {
+            /* Refused while a pulse/train is running: the DAC / IOMUX
+             * writes below must not race the ISR's outputs, and a train
+             * shouldn't change stimulus type mid-way.  The STATUS echo
+             * shows the host the mode didn't take. */
+            if (len == CMD_SET_MODE_LEN && g_state.overall == OVERALL_WAITING) {
                 uint8_t m = payload[0];
                 if (m == MODE_LASER || m == MODE_ESTIM) {
                     g_mode = m;
@@ -559,6 +711,22 @@ static void process_frame(uint8_t type, const uint8_t *payload, size_t len)
         case CMD_ESTIM_CONFIG:
             if (len == CMD_ESTIM_CONFIG_LEN) {
                 apply_estim_config(payload);
+            }
+            emit_status();
+            break;
+
+        case CMD_TRAIN_CONFIG:
+            if (len == CMD_TRAIN_CONFIG_LEN) {
+                apply_train_config(payload);
+            }
+            emit_status();
+            break;
+
+        case CMD_ABORT:
+            /* The ISR acts on the next tick (<= 10 us); the STATUS ack may
+             * still show the old phase, EVT_TRAIN_END confirms the stop. */
+            if (g_state.overall != OVERALL_WAITING) {
+                g_abort_pending = true;
             }
             emit_status();
             break;
@@ -584,18 +752,15 @@ static void drain_uart(void)
 
 static void emit_pending_events(void)
 {
-    /* The ISR fills each pulse record's tick before setting .pending, so
-     * reading .pending first guarantees the matching tick is visible.
+    /* Drain the ISR's event ring in order.  The ISR fills an entry before
+     * advancing head, so anything between tail and head is complete.
      * Pulse events are emitted for every trigger source. */
-    if (g_pulse_start_evt.pending) {
-        uint32_t tick = g_pulse_start_evt.tick;
-        g_pulse_start_evt.pending = false;
-        emit_pulse_event(EVT_PULSE_START, tick);
-    }
-    if (g_pulse_end_evt.pending) {
-        uint32_t tick = g_pulse_end_evt.tick;
-        g_pulse_end_evt.pending = false;
-        emit_pulse_event(EVT_PULSE_END, tick);
+    while (g_evt_tail != g_evt_head) {
+        uint8_t  tail = g_evt_tail;
+        uint8_t  type = g_evt_ring[tail].type;
+        uint32_t tick = g_evt_ring[tail].tick;
+        g_evt_tail = (uint8_t)((tail + 1u) & (EVT_RING_SIZE - 1u));
+        emit_pulse_event(type, tick);
     }
     if (g_btn_event.pending) {
         uint8_t p[2] = { g_btn_event.mask, g_btn_event.edges };

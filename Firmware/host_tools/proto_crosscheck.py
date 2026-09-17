@@ -22,14 +22,22 @@ BIN = "/tmp/proto_selftest"
 
 # (type, payload) — covers both directions for the encoder; only command
 # types are fed through the C decoder (the MCU only decodes commands).
+STATUS_FIELDS = (200, 8000, 10000, 0b1010, p.PHASE_TRAIN_GAP, 123456,
+                 p.MODE_ESTIM, 10, 20, 5, 2000, 3)
+
 CASES = [
     (p.CMD_TRIGGER, b""),
     (p.CMD_QUERY, b""),
+    (p.CMD_ABORT, b""),
     (p.CMD_CONFIG, p._CONFIG.pack(320, 8000, 10000)),
     (p.CMD_CONFIG, p._CONFIG.pack(1, 1, 10_000_000)),
-    (p.RSP_STATUS, p._STATUS.pack(200, 8000, 10000, 0b1010,
-                                  p.PHASE_TRIGGERED, 123456)),
+    (p.CMD_SET_MODE, bytes([p.MODE_ESTIM])),
+    (p.CMD_ESTIM_CONFIG, p._ESTIM_CONFIG.pack(10, 20)),
+    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(0, 3_600_000)),
+    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(10_000, 10)),
+    (p.RSP_STATUS, p._STATUS.pack(*STATUS_FIELDS)),
     (p.EVT_PULSE_START, p._U32.pack(0xDEADBEEF)),
+    (p.EVT_TRAIN_END, p._U32.pack(42)),
     (p.EVT_BUTTON, bytes([0b0101, 0b0100])),
 ]
 
@@ -68,9 +76,12 @@ def main():
     struct_cases = [
         ("config " + c("config", "320", "8000", "10000"),
          p._CONFIG.pack(320, 8000, 10000).hex()),
-        ("status " + c("status", "200", "8000", "10000", "10",
-                       str(p.PHASE_TRIGGERED), "123456"),
-         p._STATUS.pack(200, 8000, 10000, 10, p.PHASE_TRIGGERED, 123456).hex()),
+        ("estim " + c("estim", "10", "20"),
+         p._ESTIM_CONFIG.pack(10, 20).hex()),
+        ("train " + c("train", "5", "2000"),
+         p._TRAIN_CONFIG.pack(5, 2000).hex()),
+        ("status " + c("status", *(str(v) for v in STATUS_FIELDS)),
+         p._STATUS.pack(*STATUS_FIELDS).hex()),
     ]
     for label_got, want in struct_cases:
         label, got = label_got.split(" ", 1)

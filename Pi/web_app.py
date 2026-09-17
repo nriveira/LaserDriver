@@ -9,9 +9,12 @@ it can run at the same time as the OLED GUI (both are broker clients).
 Routes:
     GET  /                  the single page
     GET  /api/state         current MCU state as JSON (from the broker's cache)
-    POST /api/set/<knob>    body { "value": N } where knob in {i, r, h}
-    POST /api/trigger       fire a pulse via the UART trigger command
-    POST /api/trigger_gpio  fire a pulse via Pi GPIO 24 -> MSPM0 PA19 edge
+    POST /api/set/<knob>    body { "value": N } where knob in
+                            {i, r, h, ed, ei, tn, tp}
+    POST /api/set_mode      body { "mode": "laser" | "estim" }
+    POST /api/trigger       fire a pulse train via the UART trigger command
+    POST /api/trigger_gpio  fire a pulse train via Pi GPIO 24 -> MSPM0 PA19 edge
+    POST /api/abort         stop the running pulse / train
     GET  /api/healthz       cheap liveness check
 
 The app binds 0.0.0.0:8080 by default; override via PORT env var.  The
@@ -30,7 +33,7 @@ from flask import Flask, jsonify, render_template, request
 
 from hat_client import DEFAULT_SOCKET, HatClient
 from laser_hat import State
-from params import ESTIM_PARAMS_BY_NAME, PARAMS_BY_NAME
+from params import ESTIM_PARAMS_BY_NAME, PARAMS_BY_NAME, TRAIN_PARAMS_BY_NAME
 
 
 # --------------------------------------------------------------- helpers
@@ -65,6 +68,9 @@ def _state_dict(state: Optional[State]) -> dict:
         "mode":            state.mode,
         "estim_dur_ticks": state.estim_dur_ticks,
         "estim_ipi_ticks": state.estim_ipi_ticks,
+        "train_count":     state.train_count,
+        "train_period_ms": state.train_period_ms,
+        "train_done":      state.train_done,
     }
 
 
@@ -82,6 +88,7 @@ def create_app(client: HatClient) -> Flask:
             ip=primary_ip(),
             params=PARAMS_BY_NAME,
             estim_params=ESTIM_PARAMS_BY_NAME,
+            train_params=TRAIN_PARAMS_BY_NAME,
         )
 
     @app.route("/api/state")
@@ -102,6 +109,8 @@ def create_app(client: HatClient) -> Flask:
             "h":  app.config["client"].set_hold,
             "ed": app.config["client"].set_estim_dur,
             "ei": app.config["client"].set_estim_ipi,
+            "tn": app.config["client"].set_train_count,
+            "tp": app.config["client"].set_train_period,
         }.get(knob)
         if setter is None:
             return jsonify(ok=False, error="unknown_knob"), 400
@@ -125,6 +134,13 @@ def create_app(client: HatClient) -> Flask:
         arms PA19 once (lazily) — no per-trigger re-arm here."""
         ok = app.config["client"].trigger_gpio()
         return jsonify(ok=ok, path="gpio")
+
+    @app.route("/api/abort", methods=["POST"])
+    def api_abort():
+        """Stop the running pulse / train.  Firmware emits EVT_TRAIN_END
+        (and EVT_PULSE_END if it was mid-pulse)."""
+        ok = app.config["client"].abort()
+        return jsonify(ok=ok)
 
     @app.route("/api/set_mode", methods=["POST"])
     def api_set_mode():

@@ -75,6 +75,61 @@ def run() -> int:
         got_end = _wait(lambda: any(e.get("event") == "pulse_end" for e in events))
         if not (got_start and got_end):
             failures.append(f"missing pulse events (start={got_start} end={got_end})")
+        if not _wait(lambda: any(e.get("event") == "train_end" for e in events)):
+            failures.append("single pulse did not end with train_end")
+
+        def n_events(name):
+            return sum(1 for e in events if e.get("event") == name)
+
+        # --- pulse train: 3 pulses, 250 ms apart -> 3 start/end pairs, then
+        # train_end; progress and phase mirror in state along the way.
+        if not client.set_train_count(3):
+            failures.append("set_train_count(3) not acked ok")
+        if not client.set_train_period(250):
+            failures.append("set_train_period(250) not acked ok")
+        if not _wait(lambda: (getattr(client.get_state(), "train_count", None),
+                              getattr(client.get_state(), "train_period_ms", None))
+                     == (3, 250)):
+            failures.append("train config did not reflect in state")
+        if client.set_train_count(99_999):
+            failures.append("out-of-range train count wrongly accepted")
+        if client.set_train_period(1):
+            failures.append("out-of-range train period wrongly accepted")
+
+        del events[:]
+        if not client.trigger():
+            failures.append("train trigger not acked ok")
+        saw_gap = _wait(lambda: getattr(client.get_state(), "phase", None) == "G",
+                        timeout=1.0)
+        if not _wait(lambda: n_events("train_end") == 1, timeout=3.0):
+            failures.append("train_end never arrived")
+        if (n_events("pulse_start"), n_events("pulse_end")) != (3, 3):
+            failures.append(f"train fired {n_events('pulse_start')}/"
+                            f"{n_events('pulse_end')} start/end, expected 3/3")
+        if not saw_gap:
+            failures.append("phase never showed 'G' during the train")
+        if not _wait(lambda: getattr(client.get_state(), "phase", None) == "W"):
+            failures.append("phase not back to W after train")
+        st = client.get_state()
+        if st and st.train_done != 3:
+            failures.append(f"train_done {st.train_done}, expected 3")
+
+        # --- unlimited train (count 0) runs until abort.
+        if not client.set_train_count(0):
+            failures.append("set_train_count(0) not acked ok")
+        del events[:]
+        if not client.trigger():
+            failures.append("unlimited train trigger not acked ok")
+        if not _wait(lambda: n_events("pulse_start") >= 2, timeout=2.0):
+            failures.append("unlimited train did not repeat")
+        if not client.abort():
+            failures.append("abort not acked ok")
+        if not _wait(lambda: n_events("train_end") == 1):
+            failures.append("abort: no train_end")
+        if not _wait(lambda: getattr(client.get_state(), "phase", None) == "W"):
+            failures.append("abort: phase not back to W")
+        if not client.set_train_count(1):
+            failures.append("set_train_count(1) restore not acked ok")
 
         client.close()
     finally:
@@ -91,7 +146,8 @@ def run() -> int:
         for f in failures:
             print("FAIL:", f)
         return 1
-    print("integration OK: alive, set+mirror, range-reject, pulse events")
+    print("integration OK: alive, set+mirror, range-reject, pulse events, "
+          "train (3x + gap phase), unlimited train + abort")
     return 0
 
 

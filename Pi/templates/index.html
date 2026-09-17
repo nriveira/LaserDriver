@@ -40,6 +40,7 @@
                   font-size: 12px; font-weight: 600; letter-spacing: 0.05em; }
     .phase-W { background: #e8e8e8; color: #444; }
     .phase-T { background: var(--accent); color: white; }
+    .phase-G { background: #d98a1a; color: white; }
 
     .card { background: var(--card); border: 1px solid var(--border);
             border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -66,6 +67,10 @@
     .trigger:disabled { background: #aaa; cursor: not-allowed; }
     .trigger:active { transform: translateY(1px); }
     .trigger-gpio { background: var(--ok); }
+    .abort { background: #444; }
+    .abort.hidden { display: none; }
+    .train-progress { font-family: ui-monospace, monospace; font-size: 14px;
+                      color: var(--muted); margin-top: 8px; min-height: 1.2em; }
     .trigger-note { color: var(--muted); font-size: 12px; margin-top: 10px;
                     max-width: 520px; margin-left: auto; margin-right: auto;
                     line-height: 1.4; }
@@ -156,13 +161,41 @@
     </div>
   </div>
 
+  <div class="card">
+    <div style="font-size: 13px; color: var(--muted); margin-bottom: 10px;">
+      Pulse train — every trigger fires <b>count</b> pulses (0 = repeat until
+      STOP), each with the pulse settings above, spaced <b>period</b> apart
+      (start to start, timed by the MCU). Count 1 is a single pulse.
+    </div>
+    <div class="row">
+      <label>count</label>
+      <button data-knob="tn" data-dir="-1">−</button>
+      <input class="step-input" data-knob="tn" id="step-tn" type="number" value="{{ train_params['tn'].step }}" min="1" max="{{ train_params['tn'].maximum }}">
+      <button data-knob="tn" data-dir="+1">+</button>
+      <span class="value" id="val-tn">—</span>
+      <span class="unit" id="unit-tn">pulses</span>
+    </div>
+
+    <div class="row">
+      <label>period</label>
+      <button data-knob="tp" data-dir="-1">−</button>
+      <input class="step-input" data-knob="tp" id="step-tp" type="number" value="{{ train_params['tp'].step }}" min="1" max="{{ train_params['tp'].maximum }}">
+      <button data-knob="tp" data-dir="+1">+</button>
+      <span class="value" id="val-tp">—</span>
+      <span class="unit" id="unit-tp">ms</span>
+    </div>
+    <div class="train-progress" id="train-progress"></div>
+  </div>
+
   <div class="trigger-row">
     <button id="trigger" class="trigger">TRIGGER (UART)</button>
     <button id="trigger-gpio" class="trigger trigger-gpio">TRIGGER (GPIO)</button>
+    <button id="abort" class="trigger abort hidden">STOP</button>
     <div class="trigger-note">
       UART path waits for byte send + parse + state-machine tick (~300–700 µs,
       with scheduler jitter).  GPIO path drives Pi GPIO 24 high so the MCU's
       PA19 edge ISR fires the pulse directly (~50–100 µs, deterministic).
+      STOP ends a running train immediately (outputs safe within 10 µs).
     </div>
   </div>
 
@@ -247,13 +280,26 @@ async function refresh() {
     $("val-ed").textContent = s.estim_dur_ticks * 10;
     $("val-ei").textContent = s.estim_ipi_ticks * 10;
 
+    // Train params
+    $("val-tn").textContent = s.train_count === 0 ? "∞" : s.train_count;
+    $("unit-tn").textContent = s.train_count === 0 ? "until STOP" : "pulses";
+    $("val-tp").textContent = s.train_period_ms;
+    $("unit-tp").textContent = `ms (${(s.train_period_ms/1000).toFixed(2)} s)`;
+    const running = s.phase !== "W";
+    const multi = s.train_count !== 1;
+    $("train-progress").textContent =
+      running && multi
+        ? `train running: pulse ${s.train_done} of ${s.train_count === 0 ? "∞" : s.train_count}`
+        : (!running && multi && s.train_done > 0 ? `last train: ${s.train_done} pulses` : "");
+
     $("tick").textContent = s.tick;
 
     const phaseEl = $("phase");
-    phaseEl.textContent = s.phase === "T" ? "TRIG" : "WAIT";
+    phaseEl.textContent = {T: "TRIG", G: "GAP"}[s.phase] || "WAIT";
     phaseEl.className = `phase-pill phase-${s.phase}`;
-    $("trigger").disabled      = s.phase === "T";
-    $("trigger-gpio").disabled = s.phase === "T";
+    $("trigger").disabled      = running;
+    $("trigger-gpio").disabled = running;
+    $("abort").classList.toggle("hidden", !running);
 
     for (let i = 0; i < 4; i++) {
       const el = $("btn" + (i + 1));
@@ -282,6 +328,8 @@ document.querySelectorAll("button[data-knob]").forEach(btn => {
       h: lastState.hold_ticks,
       ed: lastState.estim_dur_ticks,
       ei: lastState.estim_ipi_ticks,
+      tn: lastState.train_count,
+      tp: lastState.train_period_ms,
     };
     const current = currentMap[knob];
     if (current === undefined) return;
@@ -299,6 +347,12 @@ $("trigger").addEventListener("click", async () => {
 
 $("trigger-gpio").addEventListener("click", async () => {
   await postTrigger("gpio");
+  refresh();
+});
+
+$("abort").addEventListener("click", async () => {
+  const resp = await fetch("/api/abort", { method: "POST" });
+  if (!resp.ok) $("err").textContent = "abort failed";
   refresh();
 });
 

@@ -18,7 +18,10 @@ import protocol as p
     (p.CMD_TRIGGER, b""),
     (p.CMD_QUERY, b""),
     (p.CMD_CONFIG, p._CONFIG.pack(320, 8000, 10000)),
+    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(5, 2000)),
+    (p.CMD_ABORT, b""),
     (p.EVT_PULSE_START, p._U32.pack(0xDEADBEEF)),
+    (p.EVT_TRAIN_END, p._U32.pack(7)),
     (p.EVT_BUTTON, bytes([0b0101, 0b0100])),
 ])
 def test_frame_roundtrip(msg_type, payload):
@@ -36,7 +39,27 @@ def test_status_roundtrip():
     assert p.unpack_status(payload) == {
         "intensity": 200, "ramp_ticks": 8000, "hold_ticks": 10000,
         "button_mask": 0b1010, "phase": "T", "tick": 123456,
+        "mode": p.MODE_LASER, "estim_dur_ticks": 10, "estim_ipi_ticks": 10,
+        "train_count": 1, "train_period_ms": 1000, "train_done": 0,
     }
+
+
+def test_status_train_gap_phase_roundtrip():
+    wire = p.pack_status(1, 1, 1, 0, "G", 9, train_count=0,
+                         train_period_ms=3_600_000, train_done=42)
+    (_, payload), = p.StreamDecoder().feed(wire)
+    f = p.unpack_status(payload)
+    assert (f["phase"], f["train_count"], f["train_period_ms"], f["train_done"]) \
+        == ("G", 0, 3_600_000, 42)
+    assert p.status_in_range(f)
+
+
+def test_status_range_rejects_bad_train_fields():
+    ok = p.unpack_status(p.pack_status(1, 1, 1, 0, "W", 0)[3:])
+    assert p.status_in_range(ok)
+    assert not p.status_in_range({**ok, "train_count": p.TRAIN_COUNT_MAX + 1})
+    assert not p.status_in_range({**ok, "train_period_ms": p.TRAIN_PERIOD_MIN - 1})
+    assert not p.status_in_range({**ok, "train_period_ms": p.TRAIN_PERIOD_MAX + 1})
 
 
 # --- magic avoidance for CONFIG -----------------------------------------
@@ -56,6 +79,18 @@ def test_config_payload_never_contains_sync():
             wire = p.pack_config(320, p.avoid_magic(r), p.avoid_magic(h))
             payload = wire[3:]                # strip SYNC + TYPE
             assert p.SYNC not in payload, (r, h)
+
+
+def test_train_config_payload_never_contains_sync():
+    # count <= 10000 keeps its high byte < 0xAD; period (ms, <= 1 h) keeps
+    # its top byte < 0xAD; only period's low 16 bits can collide -> nudged.
+    for n in (0, 1, 0xDE, 0xADDE & p.TRAIN_COUNT_MAX, p.TRAIN_COUNT_MAX):
+        for per in (p.MAGIC16, p.MAGIC16 | 0x10000, 0xDE, p.TRAIN_PERIOD_MIN,
+                    p.TRAIN_PERIOD_MAX):
+            per = p.avoid_magic(per, p.TRAIN_PERIOD_MAX)
+            assert p.TRAIN_PERIOD_MIN <= per <= p.TRAIN_PERIOD_MAX
+            wire = p.pack_train_config(n, per)
+            assert p.SYNC not in wire[3:], (n, per)
 
 
 # --- stream behaviour: framing, concatenation, resync -------------------
@@ -95,8 +130,6 @@ def test_stream_recovers_after_dropped_byte():
 
 
 def test_status_range_check_rejects_garbage():
-    assert p.status_in_range(p.unpack_status(
-        p.pack_status(200, 8000, 10000, 1, "W", 5)[3:]))
-    assert not p.status_in_range({
-        "intensity": 9999, "ramp_ticks": 1, "hold_ticks": 1,
-        "button_mask": 0, "phase": "W", "tick": 0})
+    good = p.unpack_status(p.pack_status(200, 8000, 10000, 1, "W", 5)[3:])
+    assert p.status_in_range(good)
+    assert not p.status_in_range({**good, "intensity": 9999})

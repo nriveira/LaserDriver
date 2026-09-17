@@ -132,8 +132,16 @@ hardware writes and is idempotent — it re-asserts the desired output
 state every tick (all plain register stores, no read-modify-write), so a
 perturbed IOMUX/GPIO self-heals within 10 µs. `main`
 only reads the machine for the `CMD_QUERY` → `RSP_STATUS` response and
-drains ISR-produced pulse-event records to emit the `EVT_PULSE_START` /
-`EVT_PULSE_END` frames off the interrupt path.
+drains the ISR-produced pulse-event ring to emit the `EVT_PULSE_START` /
+`EVT_PULSE_END` / `EVT_TRAIN_END` frames off the interrupt path.
+
+A trigger starts a **pulse train** (`count` pulses, `period` apart; the
+default `count=1` is a single pulse).  The train logic lives in the same
+ISR: `OVERALL_TRAIN_GAP` is the outputs-safe wait between pulses, each
+pulse re-latches the live pulse config at its start, and the train
+parameters are read live (single aligned loads) so mid-train edits apply
+at the next pulse boundary.  `CMD_ABORT` (or B1 during a multi-pulse
+train) sets `g_abort_pending`, which the ISR honours on the next tick.
 
 ## Commit rules
 

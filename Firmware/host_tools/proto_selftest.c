@@ -8,6 +8,10 @@
  * Usage:
  *   proto_selftest encode TYPE HEX     -> prints wire frame hex
  *   proto_selftest decode HEX          -> prints "TYPE PAYLOADHEX" per command
+ *   proto_selftest config i r h        -> packed ConfigPayload hex
+ *   proto_selftest estim dur ipi       -> packed EstimConfigPayload hex
+ *   proto_selftest train count period  -> packed TrainConfigPayload hex
+ *   proto_selftest status <12 fields>  -> packed StatusPayload hex
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,17 +76,37 @@ int main(int argc, char **argv)
         print_hex((const uint8_t *)&c, sizeof c);
         return 0;
     }
-    if (argc == 8 && strcmp(argv[1], "status") == 0) {
+    if (argc == 4 && strcmp(argv[1], "estim") == 0) {
+        EstimConfigPayload c;
+        c.pulse_dur_ticks = (uint32_t)strtoul(argv[2], NULL, 10);
+        c.ipi_ticks       = (uint32_t)strtoul(argv[3], NULL, 10);
+        print_hex((const uint8_t *)&c, sizeof c);
+        return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "train") == 0) {
+        TrainConfigPayload c;
+        c.count     = (uint16_t)strtoul(argv[2], NULL, 10);
+        c.period_ms = (uint32_t)strtoul(argv[3], NULL, 10);
+        print_hex((const uint8_t *)&c, sizeof c);
+        return 0;
+    }
+    if (argc == 14 && strcmp(argv[1], "status") == 0) {
         StatusPayload s;
-        s.intensity   = (uint16_t)strtoul(argv[2], NULL, 10);
-        s.ramp_ticks  = (uint32_t)strtoul(argv[3], NULL, 10);
-        s.hold_ticks  = (uint32_t)strtoul(argv[4], NULL, 10);
-        s.button_mask = (uint8_t)strtoul(argv[5], NULL, 10);
-        s.phase       = (uint8_t)strtoul(argv[6], NULL, 10);
-        s.tick        = (uint32_t)strtoul(argv[7], NULL, 10);
+        s.intensity       = (uint16_t)strtoul(argv[2], NULL, 10);
+        s.ramp_ticks      = (uint32_t)strtoul(argv[3], NULL, 10);
+        s.hold_ticks      = (uint32_t)strtoul(argv[4], NULL, 10);
+        s.button_mask     = (uint8_t)strtoul(argv[5], NULL, 10);
+        s.phase           = (uint8_t)strtoul(argv[6], NULL, 10);
+        s.tick            = (uint32_t)strtoul(argv[7], NULL, 10);
+        s.mode            = (uint8_t)strtoul(argv[8], NULL, 10);
+        s.estim_dur_ticks = (uint32_t)strtoul(argv[9], NULL, 10);
+        s.estim_ipi_ticks = (uint32_t)strtoul(argv[10], NULL, 10);
+        s.train_count     = (uint16_t)strtoul(argv[11], NULL, 10);
+        s.train_period_ms = (uint32_t)strtoul(argv[12], NULL, 10);
+        s.train_done      = (uint16_t)strtoul(argv[13], NULL, 10);
         print_hex((const uint8_t *)&s, sizeof s);
         return 0;
     }
-    fprintf(stderr, "usage: %s encode|decode|config|status ...\n", argv[0]);
+    fprintf(stderr, "usage: %s encode|decode|config|estim|train|status ...\n", argv[0]);
     return 2;
 }

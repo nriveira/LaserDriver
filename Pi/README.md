@@ -12,9 +12,14 @@ the OLED GUI and the web GUI run at the same time.
                                           (GPIO 24)      oled_gui.py  web_app.py
 ```
 
-Clients publish commands up (`set` / `trigger` / `trigger_gpio`); the broker
-broadcasts state + button/pulse events down. Only the broker touches the
-UART; everything else talks to the broker.
+Clients publish commands up (`set` / `set_mode` / `trigger` / `trigger_gpio`
+/ `abort`); the broker broadcasts state + button/pulse/train events down.
+Only the broker touches the UART; everything else talks to the broker.
+
+Every trigger fires a **pulse train**: `train count` pulses (0 = until
+STOP) spaced `train period` ms apart, each with the current pulse settings.
+The default count of 1 is a single pulse, so nothing changes unless you
+raise it. Both GUIs expose the two train knobs, live progress, and STOP.
 
 ## Files
 
@@ -100,11 +105,11 @@ reported by the MCU over the broker:
 
 ```
 +------+
-|  B1  |  trigger a pulse (firmware fires on release)
-+------+
-| OLED |   B2 : cycle selected parameter (i → r → h)
+|  B1  |  trigger a pulse train (firmware fires on release);
++------+  while a multi-pulse train runs, B1 stops it instead
+| OLED |   B2 : cycle selected parameter (i → r → h → n → T → [mode])
 +------+   B3 / B4 : decrement / increment it
-| B3 B4|
+| B3 B4|   (n = train count, "inf" = until stopped; T = train period)
 +------+
 ```
 

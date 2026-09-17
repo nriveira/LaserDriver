@@ -21,11 +21,17 @@ is no arming step.
 IPC is newline-delimited JSON.  Client -> broker:
     {"cmd": "set", "knob": "i", "value": 320}   {"cmd": "trigger"}
     {"cmd": "trigger_gpio"}                      {"cmd": "query"}
+    {"cmd": "set_mode", "mode": "laser"|"estim"} {"cmd": "abort"}
+  knobs: i r h (laser), ed ei (estim), tn tp (train count / period ms)
 Broker -> client:
-    {"type": "state", "ok": true, "intensity": ..., "phase": "W", ...}
+    {"type": "state", "ok": true, "intensity": ..., "phase": "W"|"T"|"G", ...}
     {"type": "event", "event": "button", "mask": .., "edges": ..}
-    {"type": "event", "event": "pulse_start"|"pulse_end", "tick": ..}
+    {"type": "event", "event": "pulse_start"|"pulse_end"|"train_end", "tick": ..}
     {"type": "reply", "cmd": "set", "ok": true}
+
+A trigger fires a pulse *train*: train_count pulses (0 = until abort)
+spaced train_period_ms apart; the default count of 1 is a single pulse.
+phase "G" is the gap between pulses of a running train.
 """
 
 from __future__ import annotations
@@ -53,7 +59,8 @@ POLL_INTERVAL = 0.25                    # s between liveness CMD_QUERY polls
 REPLY_TIMEOUT = 0.5                     # s to wait for a STATUS echo
 LIVENESS_TIMEOUT = 1.5                  # s without a status -> mcu_alive False
 _KNOB_FIELD = {"i": "intensity", "r": "ramp_ticks", "h": "hold_ticks",
-               "ed": "estim_dur_ticks", "ei": "estim_ipi_ticks"}
+               "ed": "estim_dur_ticks", "ei": "estim_ipi_ticks",
+               "tn": "train_count", "tp": "train_period_ms"}
 
 
 class Broker:
@@ -67,6 +74,7 @@ class Broker:
             "button_mask": 0, "phase": "W", "tick": 0,
             "mode": proto.MODE_LASER,
             "estim_dur_ticks": None, "estim_ipi_ticks": None,
+            "train_count": None, "train_period_ms": None, "train_done": 0,
         }
         self._state_lock = threading.Lock()
         self._last_status_at = 0.0
@@ -131,7 +139,14 @@ class Broker:
         elif mtype == proto.EVT_PULSE_START:
             self._pulse("T", "pulse_start", payload)
         elif mtype == proto.EVT_PULSE_END:
-            self._pulse("W", "pulse_end", payload)
+            # A single pulse (count 1) goes straight back to WAITING; a
+            # train enters the gap.  EVT_TRAIN_END settles the final
+            # answer either way, and the STATUS poll is ground truth.
+            with self._state_lock:
+                single = self._state["train_count"] in (None, 1)
+            self._pulse("W" if single else "G", "pulse_end", payload)
+        elif mtype == proto.EVT_TRAIN_END:
+            self._pulse("W", "train_end", payload)
         elif mtype == proto.EVT_BUTTON and len(payload) >= 2:
             with self._state_lock:
                 self._state["button_mask"] = payload[0]
@@ -204,6 +219,24 @@ class Broker:
         if field is None:
             return False
 
+        if knob in ("tn", "tp"):
+            with self._state_lock:
+                n = self._state["train_count"]
+                p = self._state["train_period_ms"]
+            if None in (n, p):
+                return False
+            cfg = {"train_count": n, "train_period_ms": p}
+            cfg[field] = value
+            n = cfg["train_count"]
+            p = proto.avoid_magic(cfg["train_period_ms"], proto.TRAIN_PERIOD_MAX)
+            try:
+                payload = proto._TRAIN_CONFIG.pack(n, p)
+            except Exception:
+                return False
+            echo = self._command(proto.CMD_TRAIN_CONFIG, payload)
+            return bool(echo and echo.get("train_count") == n
+                        and echo.get("train_period_ms") == p)
+
         if knob in ("ed", "ei"):
             with self._state_lock:
                 dur = self._state["estim_dur_ticks"]
@@ -249,6 +282,10 @@ class Broker:
 
     def trigger_uart(self) -> bool:
         return self._command(proto.CMD_TRIGGER) is not None
+
+    def abort(self) -> bool:
+        """Stop the running pulse / train (outputs safe within one tick)."""
+        return self._command(proto.CMD_ABORT) is not None
 
     def trigger_gpio(self) -> bool:
         if self._gpio is None:
@@ -320,6 +357,8 @@ class _Handler(socketserver.StreamRequestHandler):
         if cmd == "query":
             broker._command(proto.CMD_QUERY)
             return {"type": "reply", "cmd": "query", "ok": True}
+        if cmd == "abort":
+            return {"type": "reply", "cmd": "abort", "ok": broker.abort()}
         if cmd == "set_mode":
             mode_str = msg.get("mode")
             mode_val = {"laser": proto.MODE_LASER,
