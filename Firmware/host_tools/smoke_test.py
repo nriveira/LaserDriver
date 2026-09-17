@@ -83,27 +83,28 @@ def main() -> int:
         raise SystemExit(f"missing pulse events (start={bool(start)} end={bool(end)})")
     print("  <- EVT_PULSE_START / EVT_PULSE_END")
 
-    print("\n-- pulse train: 3 pulses, 300 ms apart --")
-    uart.send(proto.CMD_TRAIN_CONFIG, proto._TRAIN_CONFIG.pack(3, 300))
+    print("\n-- REPEAT mode: re-fire every 5 s, then abort (~6 s) --")
+    uart.send(proto.CMD_SET_MODE, bytes([proto.MODE_LASER | proto.MODE_REPEAT]))
     st = status(uart, rdr, "echo")
-    if (st.train_count, st.train_period_ms) != (3, 300):
-        raise SystemExit("train config echo did not match")
+    if not st.repeat:
+        raise SystemExit("repeat mode echo did not match")
     uart.send(proto.CMD_TRIGGER)
     status(uart, rdr, "ack")
-    for n in range(3):
-        if not (rdr.wait_for({proto.EVT_PULSE_START}) and rdr.wait_for({proto.EVT_PULSE_END})):
-            raise SystemExit(f"train pulse {n + 1}: missing START/END")
-    if not rdr.wait_for({proto.EVT_TRAIN_END}):
-        raise SystemExit("missing EVT_TRAIN_END")
-    print("  <- 3x EVT_PULSE_START/END, then EVT_TRAIN_END")
-
-    print("\n-- abort an unlimited train --")
-    uart.send(proto.CMD_TRAIN_CONFIG, proto._TRAIN_CONFIG.pack(0, 300))
-    status(uart, rdr, "echo")
-    uart.send(proto.CMD_TRIGGER)
-    status(uart, rdr, "ack")
-    rdr.wait_for({proto.EVT_PULSE_START})
-    rdr.wait_for({proto.EVT_PULSE_START})       # second pulse: it repeats
+    t0 = time.monotonic()
+    if not rdr.wait_for({proto.EVT_PULSE_START}):
+        raise SystemExit("repeat: missing first EVT_PULSE_START")
+    if not rdr.wait_for({proto.EVT_PULSE_END}):
+        raise SystemExit("repeat: missing first EVT_PULSE_END")
+    uart.send(proto.CMD_QUERY)
+    st = status(uart, rdr, "query")
+    if st.phase != "G":
+        raise SystemExit(f"repeat: phase {st.phase!r} in the gap, expected 'G'")
+    if not rdr.wait_for({proto.EVT_PULSE_START}, timeout=7.0):
+        raise SystemExit("repeat: second pulse never fired")
+    dt = time.monotonic() - t0
+    print(f"  <- second pulse after {dt:.2f} s (expect ~5.0)")
+    if not 4.5 <= dt <= 5.5:
+        raise SystemExit("repeat: period out of tolerance")
     uart.send(proto.CMD_ABORT)
     status(uart, rdr, "ack")
     if not rdr.wait_for({proto.EVT_TRAIN_END}):
@@ -115,7 +116,7 @@ def main() -> int:
     print("  <- EVT_TRAIN_END, phase W")
 
     print("\n-- restore defaults --")
-    uart.send(proto.CMD_TRAIN_CONFIG, proto._TRAIN_CONFIG.pack(1, 1000))
+    uart.send(proto.CMD_SET_MODE, bytes([proto.MODE_LASER]))
     status(uart, rdr, "echo")
     uart.send(proto.CMD_CONFIG, proto._CONFIG.pack(320, 8000, 10000))
     status(uart, rdr, "echo")

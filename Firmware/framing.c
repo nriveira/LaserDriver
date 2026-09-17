@@ -25,7 +25,6 @@ static int cmd_payload_len(uint8_t type)
         case CMD_QUERY:        return 0;
         case CMD_SET_MODE:     return (int)CMD_SET_MODE_LEN;
         case CMD_ESTIM_CONFIG: return (int)CMD_ESTIM_CONFIG_LEN;
-        case CMD_TRAIN_CONFIG: return (int)CMD_TRAIN_CONFIG_LEN;
         case CMD_ABORT:        return 0;
         default:               return -1;
     }

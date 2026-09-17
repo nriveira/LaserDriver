@@ -35,9 +35,6 @@ def _state_from_msg(msg: dict) -> Optional[State]:
         mode=msg.get("mode", 0),
         estim_dur_ticks=msg.get("estim_dur_ticks", 1),
         estim_ipi_ticks=msg.get("estim_ipi_ticks", 1),
-        train_count=msg["train_count"] if msg.get("train_count") is not None else 1,
-        train_period_ms=msg.get("train_period_ms") or 1000,
-        train_done=msg.get("train_done", 0),
     )
 
 
@@ -64,6 +61,7 @@ class HatClient:
         self._timeout = timeout
 
         self._state: Optional[State] = None
+        self._repeat_pulses = 0
         self._state_lock = threading.Lock()
         self._stop = False
 
@@ -91,6 +89,7 @@ class HatClient:
                 if mtype == "state":
                     with self._state_lock:
                         self._state = _state_from_msg(msg)
+                        self._repeat_pulses = int(msg.get("repeat_pulses", 0))
                 if self._on_update is not None:
                     try:
                         self._on_update(msg)
@@ -128,8 +127,17 @@ class HatClient:
         return self._command({"cmd": "set", "knob": "h", "value": ticks}).get("ok", False)
 
     def set_mode(self, mode: str) -> bool:
-        """Switch between 'laser' and 'estim' mode."""
+        """Switch the stimulus between 'laser' and 'estim' (keeps repeat)."""
         return self._command({"cmd": "set_mode", "mode": mode}).get("ok", False)
+
+    def set_repeat(self, on: bool) -> bool:
+        """Repeat mode: a trigger re-fires the pulse every 5 s until abort()."""
+        return self._command({"cmd": "set_repeat", "on": bool(on)}).get("ok", False)
+
+    def repeat_pulses(self) -> int:
+        """Pulses fired since the last trigger (broker-side count)."""
+        with self._state_lock:
+            return self._repeat_pulses
 
     def set_estim_dur(self, ticks: int) -> bool:
         return self._command({"cmd": "set", "knob": "ed", "value": ticks}).get("ok", False)
@@ -137,19 +145,11 @@ class HatClient:
     def set_estim_ipi(self, ticks: int) -> bool:
         return self._command({"cmd": "set", "knob": "ei", "value": ticks}).get("ok", False)
 
-    def set_train_count(self, count: int) -> bool:
-        """Pulses per trigger; 0 = repeat until abort()."""
-        return self._command({"cmd": "set", "knob": "tn", "value": count}).get("ok", False)
-
-    def set_train_period(self, period_ms: int) -> bool:
-        """Milliseconds between pulse starts within a train."""
-        return self._command({"cmd": "set", "knob": "tp", "value": period_ms}).get("ok", False)
-
     def trigger(self) -> bool:
         return self._command({"cmd": "trigger"}).get("ok", False)
 
     def abort(self) -> bool:
-        """Stop the running pulse / train."""
+        """Stop the running pulse / repeat train."""
         return self._command({"cmd": "abort"}).get("ok", False)
 
     def trigger_gpio(self) -> bool:

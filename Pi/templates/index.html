@@ -86,7 +86,8 @@
                 background: var(--card); color: var(--muted); }
     .mode-btn.active-laser { background: var(--accent); color: white; border-color: var(--accent); }
     .mode-btn.active-estim { background: #1a6b8a; color: white; border-color: #1a6b8a; }
-    .mode-btn:hover:not(.active-laser):not(.active-estim) { background: var(--bg); }
+    .mode-btn.active-repeat { background: #d98a1a; color: white; border-color: #d98a1a; }
+    .mode-btn:hover:not(.active-laser):not(.active-estim):not(.active-repeat) { background: var(--bg); }
     [data-panel].hidden { display: none; }
 
     footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
@@ -106,7 +107,9 @@
   <div class="mode-toggle">
     <button class="mode-btn" id="mode-laser" onclick="setMode('laser')">LASER</button>
     <button class="mode-btn" id="mode-estim" onclick="setMode('estim')">ESTIM</button>
+    <button class="mode-btn" id="mode-repeat" onclick="toggleRepeat()" title="Re-fire the pulse every 5 s until STOP">REPEAT 5 s</button>
   </div>
+  <div class="train-progress" id="train-progress"></div>
 
   <div class="card" data-panel="laser">
     <div class="row">
@@ -161,32 +164,6 @@
     </div>
   </div>
 
-  <div class="card">
-    <div style="font-size: 13px; color: var(--muted); margin-bottom: 10px;">
-      Pulse train — every trigger fires <b>count</b> pulses (0 = repeat until
-      STOP), each with the pulse settings above, spaced <b>period</b> apart
-      (start to start, timed by the MCU). Count 1 is a single pulse.
-    </div>
-    <div class="row">
-      <label>count</label>
-      <button data-knob="tn" data-dir="-1">−</button>
-      <input class="step-input" data-knob="tn" id="step-tn" type="number" value="{{ train_params['tn'].step }}" min="1" max="{{ train_params['tn'].maximum }}">
-      <button data-knob="tn" data-dir="+1">+</button>
-      <span class="value" id="val-tn">—</span>
-      <span class="unit" id="unit-tn">pulses</span>
-    </div>
-
-    <div class="row">
-      <label>period</label>
-      <button data-knob="tp" data-dir="-1">−</button>
-      <input class="step-input" data-knob="tp" id="step-tp" type="number" value="{{ train_params['tp'].step }}" min="1" max="{{ train_params['tp'].maximum }}">
-      <button data-knob="tp" data-dir="+1">+</button>
-      <span class="value" id="val-tp">—</span>
-      <span class="unit" id="unit-tp">ms</span>
-    </div>
-    <div class="train-progress" id="train-progress"></div>
-  </div>
-
   <div class="trigger-row">
     <button id="trigger" class="trigger">TRIGGER (UART)</button>
     <button id="trigger-gpio" class="trigger trigger-gpio">TRIGGER (GPIO)</button>
@@ -195,7 +172,9 @@
       UART path waits for byte send + parse + state-machine tick (~300–700 µs,
       with scheduler jitter).  GPIO path drives Pi GPIO 24 high so the MCU's
       PA19 edge ISR fires the pulse directly (~50–100 µs, deterministic).
-      STOP ends a running train immediately (outputs safe within 10 µs).
+      With REPEAT on, a trigger re-fires the same pulse every 5 s (pulse
+      start to pulse start, timed by the MCU) until STOP, for repeated
+      measurements.  STOP ends it immediately (outputs safe within 10 µs).
     </div>
   </div>
 
@@ -247,14 +226,27 @@ async function setMode(mode) {
   refresh();
 }
 
+async function toggleRepeat() {
+  if (!lastState) return;
+  const resp = await fetch("/api/set_repeat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on: !lastState.repeat }),
+  });
+  if (!resp.ok) $("err").textContent = "repeat toggle failed (stop the train first?)";
+  refresh();
+}
+
 function applyMode(mode) {
-  // 0 = laser, 1 = estim
-  const isEstim = mode === 1;
+  // bit 0: 0 = laser, 1 = estim; bit 1: repeat every 5 s
+  const isEstim = (mode & 1) === 1;
+  const repeat = (mode & 2) === 2;
   document.querySelectorAll("[data-panel]").forEach(el => {
     el.classList.toggle("hidden", el.dataset.panel === (isEstim ? "laser" : "estim"));
   });
   $("mode-laser").className = "mode-btn" + (isEstim ? "" : " active-laser");
   $("mode-estim").className = "mode-btn" + (isEstim ? " active-estim" : "");
+  $("mode-repeat").className = "mode-btn" + (repeat ? " active-repeat" : "");
 }
 
 let lastState = null;
@@ -280,17 +272,12 @@ async function refresh() {
     $("val-ed").textContent = s.estim_dur_ticks * 10;
     $("val-ei").textContent = s.estim_ipi_ticks * 10;
 
-    // Train params
-    $("val-tn").textContent = s.train_count === 0 ? "∞" : s.train_count;
-    $("unit-tn").textContent = s.train_count === 0 ? "until STOP" : "pulses";
-    $("val-tp").textContent = s.train_period_ms;
-    $("unit-tp").textContent = `ms (${(s.train_period_ms/1000).toFixed(2)} s)`;
+    // Repeat-train progress (pulses since the last trigger, counted by the broker)
     const running = s.phase !== "W";
-    const multi = s.train_count !== 1;
     $("train-progress").textContent =
-      running && multi
-        ? `train running: pulse ${s.train_done} of ${s.train_count === 0 ? "∞" : s.train_count}`
-        : (!running && multi && s.train_done > 0 ? `last train: ${s.train_done} pulses` : "");
+      running && s.repeat
+        ? `repeating every 5 s — pulse #${s.repeat_pulses}`
+        : (!running && s.repeat && s.repeat_pulses > 0 ? `last run: ${s.repeat_pulses} pulses` : "");
 
     $("tick").textContent = s.tick;
 
@@ -328,8 +315,6 @@ document.querySelectorAll("button[data-knob]").forEach(btn => {
       h: lastState.hold_ticks,
       ed: lastState.estim_dur_ticks,
       ei: lastState.estim_ipi_ticks,
-      tn: lastState.train_count,
-      tp: lastState.train_period_ms,
     };
     const current = currentMap[knob];
     if (current === undefined) return;

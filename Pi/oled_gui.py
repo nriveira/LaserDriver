@@ -6,23 +6,22 @@ web GUI.  Button presses arrive as EVT_BUTTON broadcasts; state arrives
 as broadcast snapshots — no polling.
 
 Button mapping (LaserHAT hardware buttons, reported by MCU):
-    B1  trigger a pulse train — firmware fires on release; while a
-        multi-pulse train is running, B1 stops it instead.
-    B2  cycle selected row (laser: i→r→h→n→T→[mode]; estim: dur→IPI→n→T→[mode])
-    B3  decrement selected value  (on [mode] row: switch to LASER)
-    B4  increment selected value  (on [mode] row: switch to ESTIM)
+    B1  trigger a pulse — firmware fires on release.  In REPEAT mode,
+        while the train is running, B1 stops it instead.
+    B2  cycle selected row (laser: i→r→h→[mode]→[rep]; estim: dur→IPI→[mode]→[rep])
+    B3  decrement selected value  ([mode]: LASER; [rep]: off)
+    B4  increment selected value  ([mode]: ESTIM; [rep]: on)
 
 Display layout (128×32, font 8px → 4 rows):
-    Row 0  header: "LaserHAT[L|E]"  +  IP right-aligned (or "k/n" train
-           progress while a train is running)
+    Row 0  header: "LaserHAT[L|E]" (+"R" when repeat is on)  +  IP
+           right-aligned, or "#k" pulses fired while a repeat train runs
     Row 1  ┐
     Row 2  ├  3-row scrolling window over the selectable items
     Row 3  ┘  phase chip (WAIT/TRIG/GAP) pinned to bottom-right corner
 
-In LASER mode the selectable items are: i, r, h, n, T, [mode]
-In ESTIM mode the selectable items are: dur (ed), IPI (ei), n, T, [mode]
-  n = train count (pulses per trigger, 0 = "inf" until stopped)
-  T = train period (seconds between pulse starts)
+In LASER mode the selectable items are: i, r, h, [mode], [rep]
+In ESTIM mode the selectable items are: dur (ed), IPI (ei), [mode], [rep]
+  [rep:5s] = REPEAT: a trigger re-fires the pulse every 5 s until stopped.
 The window scrolls so the selected item is always visible.
 """
 
@@ -40,7 +39,7 @@ from PIL import ImageDraw, ImageFont
 from oled_panel import OledPanel
 from hat_client import DEFAULT_SOCKET, HatClient
 from laser_hat import State
-from params import ESTIM_PARAMS, PARAMS, TRAIN_PARAMS
+from params import ESTIM_PARAMS, PARAMS
 
 
 # --------------------------------------------------------------- config
@@ -51,8 +50,9 @@ IP_CHECK_GAP  = 30.0         # poll IP this often
 # Button bits in State.button_mask / EVT_BUTTON edges.
 B1, B2, B3, B4 = 0b0001, 0b0010, 0b0100, 0b1000
 
-# Sentinel object for the mode-toggle row in the selection cycle.
+# Sentinel objects for the mode-toggle and repeat-toggle rows.
 _MODE_ITEM = object()
+_REPEAT_ITEM = object()
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -74,9 +74,9 @@ def load_font(size: int) -> ImageFont.ImageFont:
 
 def _items_for(state: State) -> list:
     """Ordered selectable items for the current mode (params + mode sentinel)."""
-    if state.mode == 1:     # ESTIM
-        return list(ESTIM_PARAMS) + list(TRAIN_PARAMS) + [_MODE_ITEM]
-    return list(PARAMS) + list(TRAIN_PARAMS) + [_MODE_ITEM]
+    if state.estim:
+        return list(ESTIM_PARAMS) + [_MODE_ITEM, _REPEAT_ITEM]
+    return list(PARAMS) + [_MODE_ITEM, _REPEAT_ITEM]
 
 
 def _value_for(state: State, name: str) -> int:
@@ -86,8 +86,6 @@ def _value_for(state: State, name: str) -> int:
         "h":  state.hold_ticks,
         "ed": state.estim_dur_ticks,
         "ei": state.estim_ipi_ticks,
-        "tn": state.train_count,
-        "tp": state.train_period_ms,
     }[name]
 
 
@@ -98,8 +96,6 @@ def _set_for(client: HatClient, name: str):
         "h":  client.set_hold,
         "ed": client.set_estim_dur,
         "ei": client.set_estim_ipi,
-        "tn": client.set_train_count,
-        "tp": client.set_train_period,
     }[name]
 
 
@@ -109,21 +105,14 @@ _FMT = {
     "h":  lambda v: f"{v}({v/100:.0f}ms)",
     "ed": lambda v: f"{v * 10}us",
     "ei": lambda v: f"{v * 10}us",
-    "tn": lambda v: "inf" if v == 0 else str(v),
-    "tp": lambda v: f"{v / 1000:g}s",
 }
 
-# Item names are the knob letters; give the train rows short labels so
-# "n:10" / "T:5s" fit beside the phase chip.
-_ROW_LABEL = {"tn": "n", "tp": "T"}
 
-
-def _progress(state: State) -> str:
-    """'k/n' while a multi-pulse train is running, else ''."""
-    if state.phase == "W" or state.train_count == 1:
+def _progress(state: State, pulses: int) -> str:
+    """'#k' pulses fired while a repeat train is running, else ''."""
+    if state.phase == "W" or not state.repeat:
         return ""
-    total = "inf" if state.train_count == 0 else str(state.train_count)
-    return f"{state.train_done}/{total}"
+    return f"#{pulses}"
 
 
 # --------------------------------------------------------------- helpers
@@ -154,6 +143,7 @@ def render(
     ip: str,
     hostname: str,
     *,
+    pulses: int = 0,
     force_full: bool = False,
 ) -> None:
     W, H = panel.size           # (128, 32)
@@ -162,13 +152,13 @@ def render(
     font = load_font(8)
     ON, OFF = 1, 0
 
-    # Header: brand with mode tag [L]/[E]; right side is the train progress
-    # while a train runs, otherwise the IP (if it fits).
-    mode_tag = "E" if state.mode == 1 else "L"
+    # Header: brand with mode tag [L]/[E] (+R when repeating); right side
+    # is the pulse count while a repeat train runs, otherwise the IP.
+    mode_tag = ("E" if state.estim else "L") + ("R" if state.repeat else "")
     brand = f"LaserHAT[{mode_tag}]"
     draw.text((0, 0), brand, fill=ON, font=font)
     brand_w = draw.textlength(brand, font=font)
-    right = _progress(state) or ip
+    right = _progress(state, pulses) or ip
     right_w = draw.textlength(right, font=font)
     if brand_w + 4 + right_w <= W:
         draw.text((W - right_w, 0), right, fill=ON, font=font)
@@ -184,11 +174,12 @@ def render(
         abs_i = win_start + row_i
         prefix = ">" if abs_i == selected else " "
         if item is _MODE_ITEM:
-            mode_str = "ESTIM" if state.mode == 1 else "LASER"
+            mode_str = "ESTIM" if state.estim else "LASER"
             text = f"{prefix}[mode:{mode_str}]"
+        elif item is _REPEAT_ITEM:
+            text = f"{prefix}[rep:{'5s' if state.repeat else 'OFF'}]"
         else:
-            label = _ROW_LABEL.get(item.name, item.name)
-            text = f"{prefix}{label}:{_FMT[item.name](_value_for(state, item.name))}"
+            text = f"{prefix}{item.name}:{_FMT[item.name](_value_for(state, item.name))}"
         draw.text((0, base_y + row_i * row_h), text, fill=ON, font=font)
 
     # Phase chip pinned to bottom-right, drawn over the tail of the last row.
@@ -216,7 +207,7 @@ def main() -> int:
 
     def handle_button(edges: int, client: HatClient) -> None:
         st = client.get_state()
-        items = _items_for(st) if st is not None else list(PARAMS) + [_MODE_ITEM]
+        items = _items_for(st) if st is not None else list(PARAMS) + [_MODE_ITEM, _REPEAT_ITEM]
 
         with ui_lock:
             ui["last_press"] = time.monotonic()
@@ -235,6 +226,9 @@ def main() -> int:
                     client.set_mode("estim")
                 elif edges & B3:
                     client.set_mode("laser")
+            elif item is _REPEAT_ITEM:
+                # B4 = repeat on, B3 = repeat off.
+                client.set_repeat(bool(edges & B4))
             else:
                 cur = _value_for(st, item.name)
                 new = max(item.minimum, min(item.maximum, cur + direction * item.step))
@@ -273,7 +267,7 @@ def main() -> int:
         state.intensity, state.ramp_ticks, state.hold_ticks,
         state.phase, selected, ip,
         state.mode, state.estim_dur_ticks, state.estim_ipi_ticks,
-        state.train_count, state.train_period_ms, state.train_done,
+        client.repeat_pulses(),
     )
     last_ip_check = time.monotonic()
 
@@ -302,14 +296,15 @@ def main() -> int:
             last_ip_check = now
             ip = primary_ip()
 
+        pulses = client.repeat_pulses()
         key = (
             state.intensity, state.ramp_ticks, state.hold_ticks,
             state.phase, selected, ip,
             state.mode, state.estim_dur_ticks, state.estim_ipi_ticks,
-            state.train_count, state.train_period_ms, state.train_done,
+            pulses,
         )
         if key != last_painted_key and (now - last_press_at) >= SETTLE_GAP:
-            render(panel, state, selected, ip, hostname)
+            render(panel, state, selected, ip, hostname, pulses=pulses)
             last_painted_key = key
 
         time.sleep(POLL_INTERVAL)

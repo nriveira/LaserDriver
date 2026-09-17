@@ -29,14 +29,14 @@
  *   g_hw_trigger_pending        set by the BNC / Pi-GPIO edge ISR
  *                               (GROUP1_IRQHandler)
  *   g_abort_pending             set by the parser on CMD_ABORT, or by
- *                               BUTTON1 release while a train is running
+ *                               BUTTON1 release while a repeat train runs
  *
- * A trigger starts a *pulse train*: `train.count` pulses (0 = until
- * abort) spaced `train.period_ticks` between pulse starts.  Between pulses
- * the machine sits in OVERALL_TRAIN_GAP with the outputs safe; if the
- * period is shorter than a pulse the next one starts on the tick after the
- * previous ends (there is always >= 1 safe tick between pulses).  The
- * default train (count 1) is exactly the old single-pulse behaviour.
+ * REPEAT mode (MODE_REPEAT bit set in g_mode): a trigger re-fires the
+ * configured single pulse every REPEAT_PERIOD_MS (5 s, pulse start to
+ * pulse start) until aborted, for repeated measurements of the same
+ * stimulus.  Between pulses the machine sits in OVERALL_TRAIN_GAP with
+ * the outputs safe.  Without the REPEAT bit a trigger is one pulse,
+ * exactly as before.
  *
  * Pulse events (EVT_PULSE_START / EVT_PULSE_END / EVT_TRAIN_END) are
  * emitted from the main loop out of a small ordered ring the ISR fills at
@@ -54,9 +54,8 @@
  * with one aligned store (atomic on M0+), and the ISR copies the struct
  * field-by-field at latch time, so no field is ever torn.  The latch is
  * the consistency point: a pulse uses whatever fields are live when it
- * starts — for a train, each pulse latches afresh.  The train parameters
- * themselves are read live by the ISR (single aligned loads), so editing
- * count / period mid-train takes effect at the next pulse boundary.
+ * starts — in REPEAT mode each pulse latches afresh, so edits made
+ * between pulses apply to the next one.
  * ----------------------------------------------------------------------- */
 
 #define PWM_PERIOD_COUNTS       320u
@@ -100,22 +99,13 @@ static volatile EstimConfig g_estim_config_live = {
 };
 static EstimConfig g_estim_config_active;   /* ISR-only */
 
-/* Pulse-train parameters.  Read live by the ISR (no latch): each field is
- * a single aligned store from the parser, so a read can't tear. */
-typedef struct {
-    uint32_t period_ticks;    /* pulse-start to pulse-start */
-    uint32_t period_ms;       /* same value as sent, for the STATUS echo */
-    uint16_t count;           /* 0 = until abort */
-} TrainConfig;
+/* REPEAT-mode spacing, pulse start to pulse start, in 100 kHz ticks. */
+#define REPEAT_PERIOD_TICKS     (REPEAT_PERIOD_MS * 100u)
 
-static volatile TrainConfig g_train_live = {
-    .period_ticks = TRAIN_PERIOD_DEFAULT * 100u,
-    .period_ms    = TRAIN_PERIOD_DEFAULT,
-    .count        = TRAIN_COUNT_DEFAULT,
-};
-
+/* Mode byte: MODE_ESTIM bit selects the stimulus, MODE_REPEAT bit makes a
+ * trigger repeat it every REPEAT_PERIOD_TICKS until aborted. */
 static volatile uint8_t g_mode = MODE_LASER;
-static          uint8_t g_mode_active;      /* ISR-only, latched at trigger */
+static          uint8_t g_mode_active;      /* ISR-only, latched per pulse */
 
 /*
  * Button debounce: require the pin to be stable for this many polls
@@ -139,7 +129,7 @@ static          uint8_t g_mode_active;      /* ISR-only, latched at trigger */
 typedef enum {
     OVERALL_WAITING,
     OVERALL_TRIGGERED,      /* a pulse is in progress */
-    OVERALL_TRAIN_GAP,      /* between pulses of a train; outputs safe */
+    OVERALL_TRAIN_GAP,      /* between pulses of a repeat train; outputs safe */
 } OverallPhase;
 
 /* Pulse shape: ramp the duty up to `intensity` over the ramp window, hold
@@ -166,7 +156,6 @@ typedef struct {
     uint32_t     ramp_step;
     uint32_t     tick_count;    /* ticks in the current sub-phase */
     uint32_t     period_count;  /* ticks since the current pulse started */
-    uint16_t     train_done;    /* pulses started in this train */
 } MachineState;
 
 typedef enum {
@@ -178,8 +167,8 @@ typedef enum {
  * Cross-context globals
  * ----------------------------------------------------------------------- */
 
-/* Pulse state — written only by TIMG0 ISR.  Main only reads .overall and
- * .train_done (each one aligned load, atomic on M0+) for RSP_STATUS. */
+/* Pulse state — written only by TIMG0 ISR.  Main only reads .overall
+ * (one word, atomic on M0+) for RSP_STATUS and the B1 / SET_MODE checks. */
 static volatile MachineState g_state = {
     .overall = OVERALL_WAITING,
     .laser   = LASER_IDLE,
@@ -198,10 +187,9 @@ static volatile bool g_abort_pending          = false;
  * consumer: the ISR writes only .head, main writes only .tail, and each
  * index is one byte, so no locking is needed.  The ISR fills the entry
  * *before* advancing .head, so a reader that sees a new head also sees
- * the entry.  Ordered, so END / next START / TRAIN_END emitted from the
- * same tick go out in the order they happened.  8 deep: pulse starts are
- * >= TRAIN_PERIOD_MIN (10 ms) apart and main drains at 1 kHz, so at most
- * a few entries are ever queued. */
+ * the entry.  Ordered, so END + TRAIN_END emitted from the same tick go
+ * out in the order they happened.  8 deep is far more than the two an
+ * abort can produce before main's 1 kHz drain. */
 typedef struct {
     uint8_t  type;      /* EVT_PULSE_START / EVT_PULSE_END / EVT_TRAIN_END */
     uint32_t tick;
@@ -271,7 +259,7 @@ static inline void latch_config_from_live(void)
 
     g_estim_config_active.pulse_dur_ticks = g_estim_config_live.pulse_dur_ticks;
     g_estim_config_active.ipi_ticks       = g_estim_config_live.ipi_ticks;
-    g_mode_active = g_mode;
+    g_mode_active = g_mode;      /* stimulus type + repeat bit */
 }
 
 /* ISR-side event producer.  Drops the event if the ring is full (can't
@@ -288,22 +276,19 @@ static inline void push_event(uint8_t type)
     }
 }
 
-/* Start one pulse (the first of a train, or the next one).  Latches the
- * pulse config live *now*, so each pulse of a train picks up edits. */
+/* Start one pulse (a single, or the next of a repeat train).  Latches the
+ * pulse config live *now*, so each repeat picks up edits. */
 static inline void start_pulse(void)
 {
     latch_config_from_live();
     g_state.overall      = OVERALL_TRIGGERED;
     g_state.tick_count   = 0u;
     g_state.period_count = 0u;
-    if (g_mode_active == MODE_ESTIM) {
+    if (g_mode_active & MODE_ESTIM) {
         g_state.estim = ESTIM_PULSE1;
     } else {
         g_state.laser     = LASER_RAMP_UP;
         g_state.ramp_step = 0u;
-    }
-    if (g_state.train_done != 0xFFFFu) {   /* saturate for count-0 trains */
-        g_state.train_done++;
     }
     push_event(EVT_PULSE_START);
 }
@@ -317,7 +302,7 @@ static inline void reset_pulse_phases(void)
     g_state.tick_count = 0u;
 }
 
-/* The train is over (all pulses done, or aborted): back to WAITING. */
+/* Abort: a repeat train (or single pulse) was stopped: back to WAITING. */
 static inline void end_train(void)
 {
     reset_pulse_phases();
@@ -325,21 +310,15 @@ static inline void end_train(void)
     push_event(EVT_TRAIN_END);
 }
 
-/* A pulse just completed.  Decide whether the train continues.  We always
- * pass through OVERALL_TRAIN_GAP for at least one tick so consecutive
- * pulses can't merge (e.g. EStim PULSE2 -> PULSE1 with PA13 never falling);
- * the GAP case below starts the next pulse as soon as the period elapses. */
+/* A pulse just completed.  In REPEAT mode wait out the rest of the period
+ * in OVERALL_TRAIN_GAP (outputs safe) and the GAP case below re-fires;
+ * otherwise this was a single pulse and we're idle. */
 static inline void end_pulse(void)
 {
     reset_pulse_phases();
     push_event(EVT_PULSE_END);
-
-    uint16_t count = g_train_live.count;
-    if (count != 0u && g_state.train_done >= count) {
-        end_train();
-    } else {
-        g_state.overall = OVERALL_TRAIN_GAP;
-    }
+    g_state.overall = (g_mode_active & MODE_REPEAT) ? OVERALL_TRAIN_GAP
+                                                    : OVERALL_WAITING;
 }
 
 static inline void state_machine_tick(void)
@@ -354,7 +333,7 @@ static inline void state_machine_tick(void)
     g_abort_pending          = false;
 
     /* --- Abort: stop immediately, outputs safe this tick.  A trigger in
-     * the same tick is dropped rather than restarting the train. --- */
+     * the same tick is dropped rather than restarting. --- */
     if (abort) {
         trigger = false;
         if (g_state.overall == OVERALL_TRIGGERED) {
@@ -369,14 +348,13 @@ static inline void state_machine_tick(void)
     switch (g_state.overall) {
         case OVERALL_WAITING:
             if (trigger) {
-                g_state.train_done = 0u;
                 start_pulse();
             }
             break;
 
         case OVERALL_TRAIN_GAP:
             g_state.period_count++;
-            if (g_state.period_count >= g_train_live.period_ticks) {
+            if (g_state.period_count >= REPEAT_PERIOD_TICKS) {
                 start_pulse();
             }
             break;
@@ -384,7 +362,7 @@ static inline void state_machine_tick(void)
         case OVERALL_TRIGGERED:
             g_state.tick_count++;
             g_state.period_count++;
-            if (g_mode_active == MODE_ESTIM) {
+            if (g_mode_active & MODE_ESTIM) {
                 switch (g_state.estim) {
                     case ESTIM_PULSE1:
                         if (g_state.tick_count >= g_estim_config_active.pulse_dur_ticks) {
@@ -445,7 +423,7 @@ static inline void set_output_from_state(void)
 
     if (g_state.overall != OVERALL_TRIGGERED) {
         /* WAITING or TRAIN_GAP: gpio-safe, mirror off */
-    } else if (g_mode_active == MODE_ESTIM) {
+    } else if (g_mode_active & MODE_ESTIM) {
         /* EStim: PA13 tracks the pulse pair; laser pins always stay safe. */
         mirror = (g_state.estim == ESTIM_PULSE1 || g_state.estim == ESTIM_PULSE2);
     } else {
@@ -524,12 +502,12 @@ static void poll_buttons(void)
                 } else {
                     g_btn_mask &= (uint8_t)~(1u << n);
                     if (n == 0u) {
-                        /* BUTTON1 release fires a pulse train.  While a
-                         * multi-pulse train is running it stops it
-                         * instead.  With the default count of 1 a press
-                         * mid-pulse is ignored, exactly as before. */
+                        /* BUTTON1 release fires a pulse.  In REPEAT mode
+                         * while the train is running it stops it instead.
+                         * Outside REPEAT a press mid-pulse is ignored,
+                         * exactly as before. */
                         if (g_state.overall != OVERALL_WAITING
-                                && g_train_live.count != 1u) {
+                                && (g_mode & MODE_REPEAT)) {
                             g_abort_pending = true;
                         } else {
                             g_button_trigger_pending = true;
@@ -560,12 +538,11 @@ static void poll_buttons(void)
  * into a ring; this code feeds them to the frame decoder.
  *
  *   CMD_CONFIG  i,r,h     -> RSP_STATUS    (status-as-ack)
- *   CMD_TRIGGER           -> RSP_STATUS, then per pulse EVT_PULSE_START/_END
- *                            and EVT_TRAIN_END once the train is over
+ *   CMD_TRIGGER           -> RSP_STATUS, then EVT_PULSE_START/_END per pulse
+ *                            (one pulse, or every 5 s in REPEAT mode)
  *   CMD_QUERY             -> RSP_STATUS
- *   CMD_SET_MODE  m       -> RSP_STATUS (ignored while a train is running)
+ *   CMD_SET_MODE  m       -> RSP_STATUS (ignored while a pulse/train runs)
  *   CMD_ESTIM_CONFIG d,i  -> RSP_STATUS
- *   CMD_TRAIN_CONFIG n,p  -> RSP_STATUS
  *   CMD_ABORT             -> RSP_STATUS, then EVT_PULSE_END (if mid-pulse)
  *                            + EVT_TRAIN_END
  *   (async)               -> EVT_BUTTON on any debounced button change
@@ -609,25 +586,8 @@ static void emit_status(void)
         .mode             = g_mode,
         .estim_dur_ticks  = g_estim_config_live.pulse_dur_ticks,
         .estim_ipi_ticks  = g_estim_config_live.ipi_ticks,
-        .train_count      = g_train_live.count,
-        .train_period_ms  = g_train_live.period_ms,
-        .train_done       = g_state.train_done,
     };
     tx_frame(RSP_STATUS, (const uint8_t *)&s, sizeof s);
-}
-
-static void apply_train_config(const uint8_t *payload)
-{
-    const TrainConfigPayload *c = (const TrainConfigPayload *)payload;
-    if (c->count > TRAIN_COUNT_MAX ||
-        c->period_ms < TRAIN_PERIOD_MIN || c->period_ms > TRAIN_PERIOD_MAX) {
-        return;
-    }
-    /* Each field is one aligned store; the ISR reads them individually at
-     * pulse boundaries, so a mid-train edit is picked up cleanly. */
-    g_train_live.count        = c->count;
-    g_train_live.period_ms    = c->period_ms;
-    g_train_live.period_ticks = c->period_ms * 100u;   /* 100 kHz tick */
 }
 
 static void apply_estim_config(const uint8_t *payload)
@@ -689,14 +649,14 @@ static void process_frame(uint8_t type, const uint8_t *payload, size_t len)
 
         case CMD_SET_MODE:
             /* Refused while a pulse/train is running: the DAC / IOMUX
-             * writes below must not race the ISR's outputs, and a train
-             * shouldn't change stimulus type mid-way.  The STATUS echo
-             * shows the host the mode didn't take. */
+             * writes below must not race the ISR's outputs, and a repeat
+             * train shouldn't change stimulus mid-way (stop it first).
+             * The STATUS echo shows the host the mode didn't take. */
             if (len == CMD_SET_MODE_LEN && g_state.overall == OVERALL_WAITING) {
                 uint8_t m = payload[0];
-                if (m == MODE_LASER || m == MODE_ESTIM) {
+                if (m <= MODE_MASK) {
                     g_mode = m;
-                    if (m == MODE_ESTIM) {
+                    if (m & MODE_ESTIM) {
                         laser_dac_disable();
                         laser_pins_to_gpio_safe();
                     } else {
@@ -711,13 +671,6 @@ static void process_frame(uint8_t type, const uint8_t *payload, size_t len)
         case CMD_ESTIM_CONFIG:
             if (len == CMD_ESTIM_CONFIG_LEN) {
                 apply_estim_config(payload);
-            }
-            emit_status();
-            break;
-
-        case CMD_TRAIN_CONFIG:
-            if (len == CMD_TRAIN_CONFIG_LEN) {
-                apply_train_config(payload);
             }
             emit_status();
             break;

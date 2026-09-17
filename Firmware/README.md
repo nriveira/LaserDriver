@@ -239,35 +239,33 @@ payload length is implied by the type — no length field, no byte-stuffing,
 (mirrored in `Pi/protocol.py`):
 
 ```
-Host -> MCU                              MCU -> Host
-  CMD_CONFIG        i u16,                 RSP_STATUS  i,r,h,buttons,phase,tick,
-                    r u32 (10 µs ticks),               mode,estim_dur,estim_ipi,
-                    h u32 (10 µs ticks)                train_count,train_period_ms,
-  CMD_TRIGGER                                          train_done
-  CMD_QUERY                                EVT_PULSE_START  tick
-  CMD_SET_MODE      mode u8                EVT_PULSE_END    tick
-  CMD_ESTIM_CONFIG  dur u32, ipi u32       EVT_TRAIN_END    tick
-  CMD_TRAIN_CONFIG  count u16, period u32  EVT_BUTTON       mask, edges
+Host -> MCU                          MCU -> Host
+  CMD_CONFIG        i u16,             RSP_STATUS  i,r,h,buttons,phase,tick,
+                    r u32 (10 µs),                 mode,estim_dur,estim_ipi
+                    h u32 (10 µs)      EVT_PULSE_START  tick
+  CMD_TRIGGER                          EVT_PULSE_END    tick
+  CMD_QUERY                            EVT_TRAIN_END    tick
+  CMD_SET_MODE      mode u8            EVT_BUTTON       mask, edges
+  CMD_ESTIM_CONFIG  dur u32, ipi u32
   CMD_ABORT
 ```
 
-Defaults at boot: `i=320 r=8000 h=10000`, train `count=1 period=1000 ms`.
-**Every command is answered with `RSP_STATUS`** (status-as-ack) — so the
-host confirms the resulting state end-to-end; that echo is the integrity
-check.  `CMD_CONFIG` sets all three stim parameters at once (atomic;
-out-of-range leaves the config unchanged, which the echo reveals).
+Defaults at boot: `i=320 r=8000 h=10000`, mode `LASER`.  **Every command
+is answered with `RSP_STATUS`** (status-as-ack) — so the host confirms the
+resulting state end-to-end; that echo is the integrity check.
+`CMD_CONFIG` sets all three stim parameters at once (atomic; out-of-range
+leaves the config unchanged, which the echo reveals).  A trigger emits
+`EVT_PULSE_START` when the pulse begins and `EVT_PULSE_END` when it ends;
+button edges arrive unsolicited as `EVT_BUTTON`.
 
-A trigger (UART, button, BNC or PA19) fires a **pulse train**: `count`
-pulses spaced `period_ms` apart (pulse start to pulse start, timed by the
-100 kHz tick ISR), each using the pulse config live when it starts.  The
-default `count=1` is a single pulse.  `count=0` repeats until `CMD_ABORT`
-(or **B1**, which stops a multi-pulse train instead of triggering).  If the
-period is shorter than a pulse the next one starts one tick after the
-previous ends.  Each pulse emits `EVT_PULSE_START` / `EVT_PULSE_END`, and
-`EVT_TRAIN_END` follows once the machine is idle again; `phase` in
-`RSP_STATUS` is `T` during a pulse, `G` in the gap between pulses of a
-train, `W` idle.  `CMD_SET_MODE` is refused while a train is running.
-Button edges arrive unsolicited as `EVT_BUTTON`.
+The `mode` byte is two bits: bit 0 selects the stimulus (`0` LASER,
+`1` ESTIM) and bit 1 is **REPEAT**.  With REPEAT set, a trigger (UART,
+button, BNC or PA19) re-fires the configured single pulse every **5 s**
+(pulse start to pulse start, timed by the 100 kHz tick ISR, each pulse
+latching the config live at its start) until `CMD_ABORT` — or **B1**, which
+stops a running repeat train instead of triggering.  Between repeats
+`phase` is `G` (outputs safe); `EVT_TRAIN_END` is emitted when the train is
+stopped.  `CMD_SET_MODE` is refused while a pulse or train is running.
 
 No CRC is needed: every command's `RSP_STATUS` echo verifies the values
 end-to-end, decoded `STATUS`/event fields are range-checked, and the host

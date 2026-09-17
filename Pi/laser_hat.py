@@ -32,12 +32,17 @@ class State:
     button_mask: int        # 4 bits, bit n = button n+1 pressed
     phase: str              # 'W' (waiting) or 'T' (triggered)
     tick: int               # MSPM0 isr_ticks at the time of query
-    mode: int = 0           # 0 = LASER, 1 = ESTIM
+    mode: int = 0           # bit0: 0 = LASER, 1 = ESTIM; bit1: REPEAT every 5 s
     estim_dur_ticks: int = proto.ESTIM_TICKS_MIN   # 100 kHz ticks (10–10000 µs)
     estim_ipi_ticks: int = proto.ESTIM_TICKS_MIN
-    train_count: int = 1        # pulses per trigger; 0 = until abort
-    train_period_ms: int = 1000 # ms between pulse starts
-    train_done: int = 0         # pulses started in the current / last train
+
+    @property
+    def estim(self) -> bool:
+        return bool(self.mode & proto.MODE_ESTIM)
+
+    @property
+    def repeat(self) -> bool:
+        return bool(self.mode & proto.MODE_REPEAT)
 
     def button(self, n: int) -> bool:
         """True if button n (1..4) is pressed."""
@@ -103,11 +108,12 @@ def _main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("query")
     sub.add_parser("trigger")
-    sub.add_parser("abort", help="stop the running pulse / train")
+    sub.add_parser("abort", help="stop the running pulse / repeat train")
     sub.add_parser("watch", help="print every frame until Ctrl-C")
-    tp = sub.add_parser("train", help="set pulse-train count (0 = until abort) and period (ms)")
-    tp.add_argument("count", type=int)
-    tp.add_argument("period_ms", type=int)
+    mp = sub.add_parser("mode", help="set mode: laser | estim, optionally --repeat")
+    mp.add_argument("stim", choices=["laser", "estim"])
+    mp.add_argument("--repeat", action="store_true",
+                    help="re-fire the pulse every 5 s until abort")
     sp = sub.add_parser("config", help="set intensity ramp hold at once")
     sp.add_argument("intensity", type=int)
     sp.add_argument("ramp", type=int)
@@ -133,9 +139,11 @@ def _main() -> int:
     elif args.cmd == "abort":
         uart.send(proto.CMD_ABORT)
         print(wait_status() or "no response")
-    elif args.cmd == "train":
-        period = proto.avoid_magic(args.period_ms, proto.TRAIN_PERIOD_MAX)
-        uart.send(proto.CMD_TRAIN_CONFIG, proto._TRAIN_CONFIG.pack(args.count, period))
+    elif args.cmd == "mode":
+        m = (proto.MODE_ESTIM if args.stim == "estim" else proto.MODE_LASER)
+        if args.repeat:
+            m |= proto.MODE_REPEAT
+        uart.send(proto.CMD_SET_MODE, bytes([m]))
         print(wait_status() or "no response")
     elif args.cmd == "config":
         r = proto.avoid_magic(args.ramp)

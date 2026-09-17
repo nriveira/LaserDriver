@@ -37,12 +37,3 @@ ESTIM_PARAMS: list[ParamSpec] = [
 ]
 
 ESTIM_PARAMS_BY_NAME: dict[str, ParamSpec] = {p.name: p for p in ESTIM_PARAMS}
-
-# Pulse-train parameters (apply in both modes).  count 0 = repeat until
-# abort; period is milliseconds between pulse starts.
-TRAIN_PARAMS: list[ParamSpec] = [
-    ParamSpec("tn", "train count",  step=1,    minimum=0,  maximum=10_000),
-    ParamSpec("tp", "train period", step=1000, minimum=10, maximum=3_600_000),
-]
-
-TRAIN_PARAMS_BY_NAME: dict[str, ParamSpec] = {p.name: p for p in TRAIN_PARAMS}

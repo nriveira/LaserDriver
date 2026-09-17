@@ -70,34 +70,33 @@ def run() -> int:
         if resp.status_code != 200:
             failures.append(f"trigger_gpio status {resp.status_code}")
 
-        # Train knobs + abort route.
-        r = c.post("/api/set/tn", json={"value": 4}).get_json()
-        if not r.get("ok"):
-            failures.append(f"set tn failed: {r}")
-        r = c.post("/api/set/tp", json={"value": 500}).get_json()
-        if not r.get("ok"):
-            failures.append(f"set tp failed: {r}")
-        if not _wait(lambda: (lambda s: (s.get("train_count"), s.get("train_period_ms")))
-                     (c.get("/api/state").get_json()) == (4, 500)):
-            failures.append("train knobs not reflected via /api/state")
-        r = c.post("/api/set/tp", json={"value": 1}).get_json()
-        if r.get("ok"):
-            failures.append("out-of-range train period wrongly ok")
+        # Repeat toggle + abort route.
         if not _wait(lambda: c.get("/api/state").get_json().get("phase") == "W"):
-            failures.append("phase never idle before train")
+            failures.append("phase never idle before repeat test")
+        r = c.post("/api/set_repeat", json={"on": True}).get_json()
+        if not r.get("ok"):
+            failures.append(f"set_repeat failed: {r}")
+        if not _wait(lambda: c.get("/api/state").get_json().get("repeat") is True):
+            failures.append("repeat not reflected via /api/state")
+        if c.post("/api/set_repeat", json={"on": "yes"}).status_code != 400:
+            failures.append("non-bool repeat body not rejected")
         r = c.post("/api/trigger").get_json()
         if not r.get("ok"):
-            failures.append(f"train trigger failed: {r}")
-        if not _wait(lambda: c.get("/api/state").get_json().get("phase") in ("T", "G")):
-            failures.append("train did not start")
+            failures.append(f"repeat trigger failed: {r}")
+        if not _wait(lambda: c.get("/api/state").get_json().get("repeat_pulses", 0) >= 2,
+                     timeout=3.0):
+            failures.append("repeat train did not fire >= 2 pulses")
         r = c.post("/api/abort").get_json()
         if not r.get("ok"):
             failures.append(f"abort failed: {r}")
         if not _wait(lambda: c.get("/api/state").get_json().get("phase") == "W"):
             failures.append("abort did not return phase to W")
+        r = c.post("/api/set_repeat", json={"on": False}).get_json()
+        if not r.get("ok"):
+            failures.append(f"set_repeat off failed: {r}")
         page = c.get("/").get_data(as_text=True)
-        if 'id="abort"' not in page or 'data-knob="tn"' not in page:
-            failures.append("index page missing train controls")
+        if 'id="abort"' not in page or 'id="mode-repeat"' not in page:
+            failures.append("index page missing repeat / stop controls")
 
         client.close()
     finally:
@@ -113,7 +112,7 @@ def run() -> int:
             print("FAIL:", f)
         return 1
     print("web OK: state, set+mirror, range-reject, trigger, trigger_gpio route, "
-          "train knobs, abort")
+          "repeat toggle, abort")
     return 0
 
 

@@ -16,9 +16,8 @@ risk. Plug the laser in only at the end.
 
 Protocol summary (frame = `SYNC(DE AD) | TYPE | payload`, no CRC):
 `CMD_CONFIG{i,r,h}` / `CMD_TRIGGER` / `CMD_QUERY` / `CMD_SET_MODE` /
-`CMD_ESTIM_CONFIG` / `CMD_TRAIN_CONFIG{count,period_ms}` / `CMD_ABORT` →
-every command is answered with `RSP_STATUS`; async `EVT_PULSE_START/END`,
-`EVT_TRAIN_END`, `EVT_BUTTON`.
+`CMD_ESTIM_CONFIG` / `CMD_ABORT` → every command is answered with
+`RSP_STATUS`; async `EVT_PULSE_START/END`, `EVT_TRAIN_END`, `EVT_BUTTON`.
 
 ---
 
@@ -45,9 +44,9 @@ python3 host_tools/smoke_test.py                # broker must be stopped
 - [ ] `query` prints a `State(...)`.
 - [ ] After `config`, the echo `State` matches `i=100 r=2000 h=500`.
 - [ ] `trigger` reports `EVT_PULSE_START / EVT_PULSE_END` (LED blinks).
-- [ ] The train section fires 3 START/END pairs ~300 ms apart then
-      `EVT_TRAIN_END`; the unlimited train repeats until `CMD_ABORT` and
-      the follow-up query shows phase `W`.
+- [ ] The REPEAT section shows phase `G` in the gap, a second pulse
+      ~5.0 s after the first, then `EVT_TRAIN_END` on `CMD_ABORT` and
+      phase `W` on the follow-up query.
 - [ ] `python3 ../Pi/laser_hat.py watch`, then press **B1** → `EVT_BUTTON`
       frames appear; B2/B3/B4 likewise.
 

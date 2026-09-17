@@ -18,7 +18,7 @@ import protocol as p
     (p.CMD_TRIGGER, b""),
     (p.CMD_QUERY, b""),
     (p.CMD_CONFIG, p._CONFIG.pack(320, 8000, 10000)),
-    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(5, 2000)),
+    (p.CMD_SET_MODE, bytes([p.MODE_ESTIM | p.MODE_REPEAT])),
     (p.CMD_ABORT, b""),
     (p.EVT_PULSE_START, p._U32.pack(0xDEADBEEF)),
     (p.EVT_TRAIN_END, p._U32.pack(7)),
@@ -40,26 +40,17 @@ def test_status_roundtrip():
         "intensity": 200, "ramp_ticks": 8000, "hold_ticks": 10000,
         "button_mask": 0b1010, "phase": "T", "tick": 123456,
         "mode": p.MODE_LASER, "estim_dur_ticks": 10, "estim_ipi_ticks": 10,
-        "train_count": 1, "train_period_ms": 1000, "train_done": 0,
     }
+    assert p._STATUS.size == 25          # unchanged wire length
 
 
-def test_status_train_gap_phase_roundtrip():
-    wire = p.pack_status(1, 1, 1, 0, "G", 9, train_count=0,
-                         train_period_ms=3_600_000, train_done=42)
+def test_status_repeat_mode_and_gap_phase_roundtrip():
+    wire = p.pack_status(1, 1, 1, 0, "G", 9, mode=p.MODE_ESTIM | p.MODE_REPEAT)
     (_, payload), = p.StreamDecoder().feed(wire)
     f = p.unpack_status(payload)
-    assert (f["phase"], f["train_count"], f["train_period_ms"], f["train_done"]) \
-        == ("G", 0, 3_600_000, 42)
+    assert (f["phase"], f["mode"]) == ("G", 3)
     assert p.status_in_range(f)
-
-
-def test_status_range_rejects_bad_train_fields():
-    ok = p.unpack_status(p.pack_status(1, 1, 1, 0, "W", 0)[3:])
-    assert p.status_in_range(ok)
-    assert not p.status_in_range({**ok, "train_count": p.TRAIN_COUNT_MAX + 1})
-    assert not p.status_in_range({**ok, "train_period_ms": p.TRAIN_PERIOD_MIN - 1})
-    assert not p.status_in_range({**ok, "train_period_ms": p.TRAIN_PERIOD_MAX + 1})
+    assert not p.status_in_range({**f, "mode": p.MODE_MASK + 1})
 
 
 # --- magic avoidance for CONFIG -----------------------------------------
@@ -79,18 +70,6 @@ def test_config_payload_never_contains_sync():
             wire = p.pack_config(320, p.avoid_magic(r), p.avoid_magic(h))
             payload = wire[3:]                # strip SYNC + TYPE
             assert p.SYNC not in payload, (r, h)
-
-
-def test_train_config_payload_never_contains_sync():
-    # count <= 10000 keeps its high byte < 0xAD; period (ms, <= 1 h) keeps
-    # its top byte < 0xAD; only period's low 16 bits can collide -> nudged.
-    for n in (0, 1, 0xDE, 0xADDE & p.TRAIN_COUNT_MAX, p.TRAIN_COUNT_MAX):
-        for per in (p.MAGIC16, p.MAGIC16 | 0x10000, 0xDE, p.TRAIN_PERIOD_MIN,
-                    p.TRAIN_PERIOD_MAX):
-            per = p.avoid_magic(per, p.TRAIN_PERIOD_MAX)
-            assert p.TRAIN_PERIOD_MIN <= per <= p.TRAIN_PERIOD_MAX
-            wire = p.pack_train_config(n, per)
-            assert p.SYNC not in wire[3:], (n, per)
 
 
 # --- stream behaviour: framing, concatenation, resync -------------------

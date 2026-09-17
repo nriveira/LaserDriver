@@ -23,7 +23,7 @@ BIN = "/tmp/proto_selftest"
 # (type, payload) — covers both directions for the encoder; only command
 # types are fed through the C decoder (the MCU only decodes commands).
 STATUS_FIELDS = (200, 8000, 10000, 0b1010, p.PHASE_TRAIN_GAP, 123456,
-                 p.MODE_ESTIM, 10, 20, 5, 2000, 3)
+                 p.MODE_ESTIM | p.MODE_REPEAT, 10, 20)
 
 CASES = [
     (p.CMD_TRIGGER, b""),
@@ -31,10 +31,8 @@ CASES = [
     (p.CMD_ABORT, b""),
     (p.CMD_CONFIG, p._CONFIG.pack(320, 8000, 10000)),
     (p.CMD_CONFIG, p._CONFIG.pack(1, 1, 10_000_000)),
-    (p.CMD_SET_MODE, bytes([p.MODE_ESTIM])),
+    (p.CMD_SET_MODE, bytes([p.MODE_ESTIM | p.MODE_REPEAT])),
     (p.CMD_ESTIM_CONFIG, p._ESTIM_CONFIG.pack(10, 20)),
-    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(0, 3_600_000)),
-    (p.CMD_TRAIN_CONFIG, p._TRAIN_CONFIG.pack(10_000, 10)),
     (p.RSP_STATUS, p._STATUS.pack(*STATUS_FIELDS)),
     (p.EVT_PULSE_START, p._U32.pack(0xDEADBEEF)),
     (p.EVT_TRAIN_END, p._U32.pack(42)),
@@ -78,8 +76,6 @@ def main():
          p._CONFIG.pack(320, 8000, 10000).hex()),
         ("estim " + c("estim", "10", "20"),
          p._ESTIM_CONFIG.pack(10, 20).hex()),
-        ("train " + c("train", "5", "2000"),
-         p._TRAIN_CONFIG.pack(5, 2000).hex()),
         ("status " + c("status", *(str(v) for v in STATUS_FIELDS)),
          p._STATUS.pack(*STATUS_FIELDS).hex()),
     ]

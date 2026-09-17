@@ -22,16 +22,19 @@ IPC is newline-delimited JSON.  Client -> broker:
     {"cmd": "set", "knob": "i", "value": 320}   {"cmd": "trigger"}
     {"cmd": "trigger_gpio"}                      {"cmd": "query"}
     {"cmd": "set_mode", "mode": "laser"|"estim"} {"cmd": "abort"}
-  knobs: i r h (laser), ed ei (estim), tn tp (train count / period ms)
+    {"cmd": "set_repeat", "on": true|false}
+  knobs: i r h (laser), ed ei (estim)
 Broker -> client:
-    {"type": "state", "ok": true, "intensity": ..., "phase": "W"|"T"|"G", ...}
+    {"type": "state", "ok": true, "intensity": ..., "phase": "W"|"T"|"G",
+     "mode": 0..3, "repeat_pulses": N, ...}
     {"type": "event", "event": "button", "mask": .., "edges": ..}
     {"type": "event", "event": "pulse_start"|"pulse_end"|"train_end", "tick": ..}
     {"type": "reply", "cmd": "set", "ok": true}
 
-A trigger fires a pulse *train*: train_count pulses (0 = until abort)
-spaced train_period_ms apart; the default count of 1 is a single pulse.
-phase "G" is the gap between pulses of a running train.
+mode bit 0 is the stimulus (laser / estim), bit 1 is REPEAT: a trigger then
+re-fires the configured pulse every 5 s until "abort" (or B1).  phase "G"
+is the gap between repeats.  repeat_pulses counts pulses since the last
+trigger (broker-side; the MCU status carries no counter).
 """
 
 from __future__ import annotations
@@ -59,8 +62,7 @@ POLL_INTERVAL = 0.25                    # s between liveness CMD_QUERY polls
 REPLY_TIMEOUT = 0.5                     # s to wait for a STATUS echo
 LIVENESS_TIMEOUT = 1.5                  # s without a status -> mcu_alive False
 _KNOB_FIELD = {"i": "intensity", "r": "ramp_ticks", "h": "hold_ticks",
-               "ed": "estim_dur_ticks", "ei": "estim_ipi_ticks",
-               "tn": "train_count", "tp": "train_period_ms"}
+               "ed": "estim_dur_ticks", "ei": "estim_ipi_ticks"}
 
 
 class Broker:
@@ -74,7 +76,7 @@ class Broker:
             "button_mask": 0, "phase": "W", "tick": 0,
             "mode": proto.MODE_LASER,
             "estim_dur_ticks": None, "estim_ipi_ticks": None,
-            "train_count": None, "train_period_ms": None, "train_done": 0,
+            "repeat_pulses": 0,
         }
         self._state_lock = threading.Lock()
         self._last_status_at = 0.0
@@ -137,14 +139,18 @@ class Broker:
             except queue.Full:
                 pass
         elif mtype == proto.EVT_PULSE_START:
+            with self._state_lock:
+                # New train if we were idle; otherwise another repeat.
+                if self._state["phase"] == "W":
+                    self._state["repeat_pulses"] = 0
+                self._state["repeat_pulses"] += 1
             self._pulse("T", "pulse_start", payload)
         elif mtype == proto.EVT_PULSE_END:
-            # A single pulse (count 1) goes straight back to WAITING; a
-            # train enters the gap.  EVT_TRAIN_END settles the final
-            # answer either way, and the STATUS poll is ground truth.
+            # In REPEAT mode the MCU enters the gap; otherwise it's idle.
+            # The STATUS poll is ground truth if this guess is stale.
             with self._state_lock:
-                single = self._state["train_count"] in (None, 1)
-            self._pulse("W" if single else "G", "pulse_end", payload)
+                repeat = bool(self._state["mode"] & proto.MODE_REPEAT)
+            self._pulse("G" if repeat else "W", "pulse_end", payload)
         elif mtype == proto.EVT_TRAIN_END:
             self._pulse("W", "train_end", payload)
         elif mtype == proto.EVT_BUTTON and len(payload) >= 2:
@@ -219,24 +225,6 @@ class Broker:
         if field is None:
             return False
 
-        if knob in ("tn", "tp"):
-            with self._state_lock:
-                n = self._state["train_count"]
-                p = self._state["train_period_ms"]
-            if None in (n, p):
-                return False
-            cfg = {"train_count": n, "train_period_ms": p}
-            cfg[field] = value
-            n = cfg["train_count"]
-            p = proto.avoid_magic(cfg["train_period_ms"], proto.TRAIN_PERIOD_MAX)
-            try:
-                payload = proto._TRAIN_CONFIG.pack(n, p)
-            except Exception:
-                return False
-            echo = self._command(proto.CMD_TRAIN_CONFIG, payload)
-            return bool(echo and echo.get("train_count") == n
-                        and echo.get("train_period_ms") == p)
-
         if knob in ("ed", "ei"):
             with self._state_lock:
                 dur = self._state["estim_dur_ticks"]
@@ -275,10 +263,24 @@ class Broker:
                     and echo["ramp_ticks"] == r and echo["hold_ticks"] == h)
 
     def set_mode(self, mode: int) -> bool:
-        if mode not in (proto.MODE_LASER, proto.MODE_ESTIM):
+        """Full mode byte (stimulus bit | repeat bit)."""
+        if not 0 <= mode <= proto.MODE_MASK:
             return False
         echo = self._command(proto.CMD_SET_MODE, bytes([mode]))
         return bool(echo and echo.get("mode") == mode)
+
+    def set_stim(self, stim: int) -> bool:
+        """Change the stimulus type, keeping the repeat flag."""
+        with self._state_lock:
+            cur = self._state["mode"]
+        return self.set_mode((cur & proto.MODE_REPEAT) | (stim & proto.MODE_ESTIM))
+
+    def set_repeat(self, on: bool) -> bool:
+        """Turn 5 s repeat on/off, keeping the stimulus type."""
+        with self._state_lock:
+            cur = self._state["mode"]
+        stim = cur & proto.MODE_ESTIM
+        return self.set_mode(stim | (proto.MODE_REPEAT if on else 0))
 
     def trigger_uart(self) -> bool:
         return self._command(proto.CMD_TRIGGER) is not None
@@ -361,10 +363,13 @@ class _Handler(socketserver.StreamRequestHandler):
             return {"type": "reply", "cmd": "abort", "ok": broker.abort()}
         if cmd == "set_mode":
             mode_str = msg.get("mode")
-            mode_val = {"laser": proto.MODE_LASER,
-                        "estim": proto.MODE_ESTIM}.get(mode_str, -1)
+            stim = {"laser": proto.MODE_LASER,
+                    "estim": proto.MODE_ESTIM}.get(mode_str, -1)
             return {"type": "reply", "cmd": "set_mode",
-                    "ok": broker.set_mode(mode_val)}
+                    "ok": stim >= 0 and broker.set_stim(stim)}
+        if cmd == "set_repeat":
+            return {"type": "reply", "cmd": "set_repeat",
+                    "ok": broker.set_repeat(bool(msg.get("on")))}
         return {"type": "reply", "ok": False, "error": "unknown_cmd"}
 
 

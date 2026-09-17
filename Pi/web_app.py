@@ -9,12 +9,12 @@ it can run at the same time as the OLED GUI (both are broker clients).
 Routes:
     GET  /                  the single page
     GET  /api/state         current MCU state as JSON (from the broker's cache)
-    POST /api/set/<knob>    body { "value": N } where knob in
-                            {i, r, h, ed, ei, tn, tp}
+    POST /api/set/<knob>    body { "value": N } where knob in {i, r, h, ed, ei}
     POST /api/set_mode      body { "mode": "laser" | "estim" }
-    POST /api/trigger       fire a pulse train via the UART trigger command
-    POST /api/trigger_gpio  fire a pulse train via Pi GPIO 24 -> MSPM0 PA19 edge
-    POST /api/abort         stop the running pulse / train
+    POST /api/set_repeat    body { "on": true | false }  (re-fire every 5 s)
+    POST /api/trigger       fire a pulse via the UART trigger command
+    POST /api/trigger_gpio  fire a pulse via Pi GPIO 24 -> MSPM0 PA19 edge
+    POST /api/abort         stop the running pulse / repeat train
     GET  /api/healthz       cheap liveness check
 
 The app binds 0.0.0.0:8080 by default; override via PORT env var.  The
@@ -33,7 +33,7 @@ from flask import Flask, jsonify, render_template, request
 
 from hat_client import DEFAULT_SOCKET, HatClient
 from laser_hat import State
-from params import ESTIM_PARAMS_BY_NAME, PARAMS_BY_NAME, TRAIN_PARAMS_BY_NAME
+from params import ESTIM_PARAMS_BY_NAME, PARAMS_BY_NAME
 
 
 # --------------------------------------------------------------- helpers
@@ -54,7 +54,7 @@ def primary_ip() -> str:
         s.close()
 
 
-def _state_dict(state: Optional[State]) -> dict:
+def _state_dict(state: Optional[State], repeat_pulses: int = 0) -> dict:
     if state is None:
         return {"ok": False, "error": "no_response"}
     return {
@@ -68,9 +68,8 @@ def _state_dict(state: Optional[State]) -> dict:
         "mode":            state.mode,
         "estim_dur_ticks": state.estim_dur_ticks,
         "estim_ipi_ticks": state.estim_ipi_ticks,
-        "train_count":     state.train_count,
-        "train_period_ms": state.train_period_ms,
-        "train_done":      state.train_done,
+        "repeat":          state.repeat,
+        "repeat_pulses":   repeat_pulses,
     }
 
 
@@ -88,12 +87,12 @@ def create_app(client: HatClient) -> Flask:
             ip=primary_ip(),
             params=PARAMS_BY_NAME,
             estim_params=ESTIM_PARAMS_BY_NAME,
-            train_params=TRAIN_PARAMS_BY_NAME,
         )
 
     @app.route("/api/state")
     def api_state():
-        return jsonify(_state_dict(app.config["client"].get_state()))
+        client = app.config["client"]
+        return jsonify(_state_dict(client.get_state(), client.repeat_pulses()))
 
     @app.route("/api/set/<knob>", methods=["POST"])
     def api_set(knob: str):
@@ -109,8 +108,6 @@ def create_app(client: HatClient) -> Flask:
             "h":  app.config["client"].set_hold,
             "ed": app.config["client"].set_estim_dur,
             "ei": app.config["client"].set_estim_ipi,
-            "tn": app.config["client"].set_train_count,
-            "tp": app.config["client"].set_train_period,
         }.get(knob)
         if setter is None:
             return jsonify(ok=False, error="unknown_knob"), 400
@@ -137,10 +134,19 @@ def create_app(client: HatClient) -> Flask:
 
     @app.route("/api/abort", methods=["POST"])
     def api_abort():
-        """Stop the running pulse / train.  Firmware emits EVT_TRAIN_END
-        (and EVT_PULSE_END if it was mid-pulse)."""
+        """Stop the running pulse / repeat train.  Firmware emits
+        EVT_TRAIN_END (and EVT_PULSE_END if it was mid-pulse)."""
         ok = app.config["client"].abort()
         return jsonify(ok=ok)
+
+    @app.route("/api/set_repeat", methods=["POST"])
+    def api_set_repeat():
+        body = request.get_json(silent=True) or {}
+        on = body.get("on")
+        if not isinstance(on, bool):
+            return jsonify(ok=False, error="bad_value"), 400
+        ok = app.config["client"].set_repeat(on)
+        return jsonify(ok=ok, on=on)
 
     @app.route("/api/set_mode", methods=["POST"])
     def api_set_mode():
