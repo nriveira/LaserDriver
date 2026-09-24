@@ -34,6 +34,7 @@ STOP.
 | `oled_gui.py` | OLED GUI daemon (broker client). |
 | `web_app.py` | Flask web GUI (broker client). |
 | `pi_trigger.py` | `PiTrigger` — drives GPIO 24 → MCU PA19 for the fast (~50–100 µs) trigger. Owned by the broker. |
+| `udp_trigger.py` | `UdpTrigger` — opt-in network trigger: a datagram from the acquisition host fires GPIO 24. Also a `send` CLI. |
 | `power_cycle.py` | Power-cycles the MCU for `make flash` (called by the firmware Makefile). |
 | `fake_mcu.py` | PTY that speaks the protocol, for off-hardware testing. |
 
@@ -115,10 +116,43 @@ reported by the MCU over the broker:
 
 Step sizes and ranges live in `params.py` (shared with the web UI).
 
+## Network trigger (closed loop)
+
+For closed-loop stimulation, Open Ephys (the ripple detector) sends one UDP
+datagram per detection and the broker fires the same GPIO 24 trigger as
+`trigger_gpio`. It is **off by default**, and it only accepts datagrams from
+addresses you list, because it fires the laser from the network:
+
+```bash
+sudo systemctl edit laserhat-broker.service
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/home/kemerelab/.venvs/laserhat/bin/python broker.py --udp-trigger-port 27136 --udp-trigger-allow <acquisition-host-ip>
+```
+
+Datagram layout (16 bytes, little-endian): `b"LTR1"`, `u32 seq`,
+`u64 sample`. `seq` goes up by one per datagram, so a lost trigger shows up
+as `seq_gaps`; `sample` is the detection's sample number, echoed in the
+`udp_trigger` event so a log lines each stimulus up with the recording. Read
+the counters with `{"cmd": "udp_stats"}` on the broker socket.
+
+Smoke test from the acquisition host (with the Pi's IP):
+
+```bash
+python3 Pi/udp_trigger.py send <pi-ip> --count 5 --interval 1
+```
+
+Triggers that arrive while a pulse is running are dropped by the MCU (see
+`Firmware/README.md`), and the default 80 ms ramp (`r=8000`) sets the light's
+effective onset — shorten `r` for closed-loop work.
+
 ## Off-hardware testing
 
 ```bash
-~/.venvs/laserhat/bin/python -m pytest Pi/tests/    # codec + broker integration + web
+~/.venvs/laserhat/bin/python -m pytest Pi/tests/    # codec + broker integration + web + UDP trigger
 ```
 
 `fake_mcu.py` is a PTY that speaks the protocol; point the broker at it with

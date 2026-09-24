@@ -22,19 +22,24 @@ IPC is newline-delimited JSON.  Client -> broker:
     {"cmd": "set", "knob": "i", "value": 320}   {"cmd": "trigger"}
     {"cmd": "trigger_gpio"}                      {"cmd": "query"}
     {"cmd": "set_mode", "mode": "laser"|"estim"} {"cmd": "abort"}
-    {"cmd": "set_repeat", "on": true|false}
+    {"cmd": "set_repeat", "on": true|false}      {"cmd": "udp_stats"}
   knobs: i r h (laser), ed ei (estim)
 Broker -> client:
     {"type": "state", "ok": true, "intensity": ..., "phase": "W"|"T"|"G",
      "mode": 0..3, "repeat_pulses": N, ...}
     {"type": "event", "event": "button", "mask": .., "edges": ..}
     {"type": "event", "event": "pulse_start"|"pulse_end"|"train_end", "tick": ..}
+    {"type": "event", "event": "udp_trigger", "seq": .., "sample": .., "gap": ..}
     {"type": "reply", "cmd": "set", "ok": true}
 
 mode bit 0 is the stimulus (laser / estim), bit 1 is REPEAT: a trigger then
 re-fires the configured pulse every 5 s until "abort" (or B1).  phase "G"
 is the gap between repeats.  repeat_pulses counts pulses since the last
 trigger (broker-side; the MCU status carries no counter).
+
+With --udp-trigger-port, the broker also fires GPIO 24 on datagrams from the
+acquisition host (see udp_trigger.py).  It is off by default and requires an
+explicit --udp-trigger-allow list, because it fires the laser from the network.
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ from typing import Optional
 
 import protocol as proto
 from laser_hat import DEFAULT_BAUD, DEFAULT_DEVICE, LaserUART
+from udp_trigger import DEFAULT_PORT as UDP_TRIGGER_PORT, UdpTrigger
 
 try:
     from pi_trigger import PiTrigger
@@ -69,6 +75,11 @@ class Broker:
     def __init__(self, uart: LaserUART, gpio_trigger=None):
         self._uart = uart
         self._gpio = gpio_trigger
+        # The Unix-socket clients and the UDP listener can both fire; a second
+        # fire() mid-pulse would cut the first pulse short and never make a
+        # new edge, so they take turns.
+        self._gpio_lock = threading.Lock()
+        self.udp_trigger: Optional[UdpTrigger] = None
 
         self._state = {
             "type": "state", "ok": False, "mcu_alive": False,
@@ -292,8 +303,12 @@ class Broker:
     def trigger_gpio(self) -> bool:
         if self._gpio is None:
             return False
-        self._gpio.fire()                 # PA19 is a trigger from boot; no arm
+        with self._gpio_lock:
+            self._gpio.fire()             # PA19 is a trigger from boot; no arm
         return True
+
+    def publish(self, msg: dict) -> None:
+        self._broadcast(msg)
 
     def stop(self) -> None:
         self._stop.set()
@@ -356,6 +371,13 @@ class _Handler(socketserver.StreamRequestHandler):
         if cmd == "trigger_gpio":
             return {"type": "reply", "cmd": "trigger_gpio",
                     "ok": broker.trigger_gpio()}
+        if cmd == "udp_stats":
+            ut = broker.udp_trigger
+            if ut is None:
+                return {"type": "reply", "cmd": "udp_stats", "ok": False,
+                        "error": "udp_trigger_off"}
+            return {"type": "reply", "cmd": "udp_stats", "ok": True,
+                    "port": ut.port, **ut.stats()}
         if cmd == "query":
             broker._command(proto.CMD_QUERY)
             return {"type": "reply", "cmd": "query", "ok": True}
@@ -402,7 +424,17 @@ def main() -> int:
     p.add_argument("--socket", default=DEFAULT_SOCKET)
     p.add_argument("--no-gpio", action="store_true",
                    help="don't open the PiTrigger GPIO (off-hardware testing)")
+    p.add_argument("--udp-trigger-port", type=int, default=0, metavar="PORT",
+                   help=f"fire GPIO 24 on trigger datagrams on this UDP port "
+                        f"(0 = off; the conventional port is {UDP_TRIGGER_PORT})")
+    p.add_argument("--udp-trigger-allow", action="append", default=[],
+                   metavar="IP", help="source address allowed to trigger "
+                   "(repeatable; required with --udp-trigger-port)")
+    p.add_argument("--udp-trigger-bind", default="0.0.0.0", metavar="IP",
+                   help="local address for the UDP trigger listener")
     args = p.parse_args()
+    if args.udp_trigger_port and not args.udp_trigger_allow:
+        p.error("--udp-trigger-port needs at least one --udp-trigger-allow")
 
     print(f"broker: opening UART {args.device} @ {args.baud}", file=sys.stderr)
     uart = LaserUART(args.device, args.baud)
@@ -418,6 +450,18 @@ def main() -> int:
     threading.Thread(target=broker.reader_loop, daemon=True).start()
     threading.Thread(target=broker.poller_loop, daemon=True).start()
 
+    if args.udp_trigger_port:
+        broker.udp_trigger = UdpTrigger(broker.trigger_gpio,
+                                        args.udp_trigger_port,
+                                        args.udp_trigger_allow,
+                                        bind=args.udp_trigger_bind,
+                                        on_event=broker.publish)
+        threading.Thread(target=broker.udp_trigger.serve_forever,
+                         daemon=True).start()
+        print(f"broker: UDP trigger on {args.udp_trigger_bind}:"
+              f"{broker.udp_trigger.port} from "
+              f"{', '.join(args.udp_trigger_allow)}", file=sys.stderr)
+
     _prepare_socket_path(args.socket)
     server = _Server(args.socket, broker)
     try:
@@ -431,6 +475,8 @@ def main() -> int:
         pass
     finally:
         broker.stop()
+        if broker.udp_trigger is not None:
+            broker.udp_trigger.close()
         server.shutdown()
         uart.close()
         try:
