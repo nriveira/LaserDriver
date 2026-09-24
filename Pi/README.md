@@ -139,10 +139,11 @@ as `seq_gaps`; `sample` is the detection's sample number, echoed in the
 `udp_trigger` event so a log lines each stimulus up with the recording. Read
 the counters with `{"cmd": "udp_stats"}` on the broker socket.
 
-Smoke test from the acquisition host (with the Pi's IP):
+On the rig the Pi is at `192.168.17.10` (web GUI on TCP 8080, trigger on
+UDP 27136). Smoke test from the acquisition host:
 
 ```bash
-python3 Pi/udp_trigger.py send <pi-ip> --count 5 --interval 1
+python3 Pi/udp_trigger.py send 192.168.17.10 --count 5 --interval 1
 ```
 
 Triggers that arrive while a pulse is running are dropped by the MCU (see
