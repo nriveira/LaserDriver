@@ -53,6 +53,14 @@ class _Listener:
         self.trig.close()
 
 
+def test_wire_layout_matches_ripple_detector():
+    # Same vector as ripple-detector Tests/LaserTriggerPacketTests.cpp
+    expected = bytes([ord("L"), ord("T"), ord("R"), ord("1"),
+                      0x04, 0x03, 0x02, 0x01,
+                      0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A])
+    assert ut.PACKET.pack(ut.MAGIC, 0x01020304, 0x0A0B0C0D0E0F1011) == expected
+
+
 def test_fires_and_reports_sample():
     L = _Listener()
     try:

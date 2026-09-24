@@ -20,8 +20,8 @@ can line a stimulus up with the recording.
 Only allow-listed source addresses are accepted -- this fires a laser, and
 any host on the subnet can send a datagram.
 
-The layout is mirrored by the ripple detector's sender (RippleDetector,
-LaserTrigger); change both together.
+The layout is mirrored by the ripple detector's sender (Source/LaserTriggerPacket.h);
+both tests check the same byte vector. Change both together.
 
 CLI smoke tool, from the acquisition host:
 
